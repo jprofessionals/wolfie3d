@@ -1479,6 +1479,41 @@ def main() -> None:
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(True)
 
+    # Hint overlay: press Z to open doors (drawn for a few seconds at start)
+    tip_timer = 5.0
+    try:
+        pygame.font.init()
+        font = pygame.font.SysFont(None, 22)
+    except Exception:
+        font = None
+    tip_tex = None
+    tip_verts = None
+    if font is not None:
+        msg = "Trykk Z for å åpne/lukke dører"
+        # Yellow text on transparent background
+        text_surf = font.render(msg, True, (255, 230, 0))
+        tex_w, tex_h = text_surf.get_width(), text_surf.get_height()
+        tip_tex = surface_to_texture(text_surf, wrap="clamp")
+        # Build quad verts centered at top with small margin
+        x = (WIDTH - tex_w) // 2
+        y = 10
+        x0 = (2.0 * x) / WIDTH - 1.0
+        x1 = (2.0 * (x + tex_w)) / WIDTH - 1.0
+        y0 = 1.0 - 2.0 * (y / HEIGHT)
+        y1 = 1.0 - 2.0 * ((y + tex_h) / HEIGHT)
+        r = g = b = 1.0
+        depth = 0.0
+        # Flip V so text renders upright
+        tip_verts = np.asarray([
+            x0, y0, 0.0, 1.0, r, g, b, depth,
+            x0, y1, 0.0, 0.0, r, g, b, depth,
+            x1, y0, 1.0, 1.0, r, g, b, depth,
+
+            x1, y0, 1.0, 1.0, r, g, b, depth,
+            x0, y1, 0.0, 0.0, r, g, b, depth,
+            x1, y1, 1.0, 0.0, r, g, b, depth,
+        ], dtype=np.float32).reshape((-1, 8))
+
     running = True
     while running:
         dt = clock.tick(FPS) / 1000.0
@@ -1584,6 +1619,11 @@ def main() -> None:
         # Minimap
         mm = build_minimap_quads()
         renderer.draw_arrays(mm, renderer.white_tex, use_tex=False, alpha=False)
+
+        # Tip overlay
+        if tip_timer > 0 and tip_tex is not None and tip_verts is not None:
+            tip_timer -= dt
+            renderer.draw_arrays(tip_verts, tip_tex, use_tex=True, alpha=True)
 
         pygame.display.flip()
 
