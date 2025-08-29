@@ -42,10 +42,21 @@ STRAFE_SPEED = 2.5
 
 # Tekstur-størrelse (for vegger)
 TEX_W = TEX_H = 256
+# Epsilon for texture coord clamping to avoid edge sampling artifacts
+TEX_EPS = 0.0005
 
 # Depth mapping
 FAR_PLANE = 100.0
 
+ 
+# Dør-konstanter
+DOOR_TILE_ID = 9        # spesialverdi i MAP for dør-celle
+DOOR_TEX_ID = 3         # bruker treteksturen visuelt
+DOOR_ANIM_TIME = 0.2    # sekunder opp/ned
+DOOR_AUTO_CLOSE = 2.0   # sekunder etter åpning
+
+# Kart (0=tomt, >0=veggtype/tekstur-id)
+ 
 # Sprites
 SPRITE_FRAME = 128
 SPRITE_V_FLIP = True
@@ -64,32 +75,38 @@ SPAWN_MIN_DIST_TO_PLAYER = 6.0
 RANDOM_SEED            = None
 
 # Kart
+ 
 MAP: list[list[int]] = [
-    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
-    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1],
-    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
-    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
-    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
-    [1,0,2,2,2,2,2,0,0,0,0,3,3,3,0,0,4,4,4,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    # 28x20 kart, dør ved (19,10) som åpner inn i ny seksjon (rom) til høyre
+    # 0..19 = original, 20..27 = utvidelse
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,2,0,0,0,0,0,0,0,0,3,0,0,0,0,0,4,0,1, 1,0,1,0,0,0,0,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1, 1,0,1,0,0,0,0,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3, 0,0,0,0,0,0,0,1],
+    [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1, 1,0,1,0,0,0,0,1],
+    [1,0,2,2,2,2,2,0,0,0,0,3,3,3,0,0,4,4,4,1, 1,0,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1, 1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1],
 ]
 MAP_W = len(MAP[0])
 MAP_H = len(MAP)
 
-# Startpos
+# Dørposisjon (kobling til ny seksjon)
+DOOR_X, DOOR_Y = 19, 10
+
+# Startpos og retning
 player_x = 3.5
 player_y = 10.5
 dir_x, dir_y = 1.0, 0.0
@@ -100,7 +117,14 @@ def in_map(ix: int, iy: int) -> bool:
     return 0 <= ix < MAP_W and 0 <= iy < MAP_H
 
 def is_wall(ix: int, iy: int) -> bool:
-    return in_map(ix, iy) and MAP[iy][ix] > 0
+    if not in_map(ix, iy):
+        return False
+    cell = MAP[iy][ix]
+    if cell == DOOR_TILE_ID:
+        d = doors.get((ix, iy))
+        # blokkér som vegg hvis ikke fullstendig åpen
+        return not (d and d.anim >= 0.999)
+    return cell > 0
 
 def live_enemy_count(enemies: list['Enemy']) -> int:
     return sum(1 for e in enemies if not e.remove)
@@ -129,6 +153,38 @@ def random_spawn_pos(max_tries: int = 200) -> tuple[float, float] | None:
 
 def clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+# Sett over synlige/utforskede fliser for minimap
+seen_tiles: set[tuple[int, int]] = set()
+
+def compute_reachable() -> set[tuple[int, int]]:
+    """Flood fill fra spillerposisjon gjennom åpne celler (0) og HELT åpne dører.
+    Returnerer sett av passérbare fliser (ikke vegger)."""
+    sx, sy = int(player_x), int(player_y)
+    if not in_map(sx, sy):
+        return set()
+    q: list[tuple[int, int]] = [(sx, sy)]
+    visited: set[tuple[int, int]] = {(sx, sy)}
+    def passable(ix: int, iy: int) -> bool:
+        if not in_map(ix, iy):
+            return False
+        cell = MAP[iy][ix]
+        if cell == 0:
+            return True
+        if cell == DOOR_TILE_ID:
+            d = doors.get((ix, iy))
+            return bool(d and d.anim >= 0.999)
+        return False
+    while q:
+        x, y = q.pop(0)
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            nx, ny = x+dx, y+dy
+            if (nx, ny) in visited:
+                continue
+            if passable(nx, ny):
+                visited.add((nx, ny))
+                q.append((nx, ny))
+    return visited
 
 # ---------- Prosjektil ----------
 class Bullet:
@@ -369,6 +425,77 @@ def make_white_texture() -> int:
     surf.fill((255, 255, 255, 255))
     return surface_to_texture(surf)
 
+ # ---------- Dør ----------
+class Door:
+    def __init__(self, x: int, y: int, tex_id: int = DOOR_TEX_ID) -> None:
+        self.x = x
+        self.y = y
+        self.tex_id = tex_id
+        self.state = "closed"  # closed/opening/open/closing
+        self.anim = 0.0         # 0.0 = lukket (full høyde), 1.0 = åpen (skjult)
+        self.timer = -1.0       # auto-close nedtelling når open
+        self.pending_close = False
+
+    def is_near_player(self) -> bool:
+        return int(player_x) == self.x and int(player_y) == self.y
+
+    def any_actor_in_tile(self, enemies: list['Enemy']) -> bool:
+        if int(player_x) == self.x and int(player_y) == self.y:
+            return True
+        for e in enemies:
+            # Enemy blocks only if not marked for removal and not in dying state
+            if getattr(e, 'remove', False):
+                continue
+            if getattr(e, 'dying', False):
+                continue
+            if int(e.x) == self.x and int(e.y) == self.y:
+                return True
+        return False
+
+    def request_open(self) -> None:
+        if self.state in ("closed", "closing"):
+            self.state = "opening"
+            self.pending_close = False
+
+    def update(self, dt: float, enemies: list['Enemy']) -> None:
+        # anim
+        if self.state == "opening":
+            self.anim += dt / DOOR_ANIM_TIME
+            if self.anim >= 1.0:
+                self.anim = 1.0
+                self.state = "open"
+                self.timer = DOOR_AUTO_CLOSE
+        elif self.state == "closing":
+            self.anim -= dt / DOOR_ANIM_TIME
+            if self.anim <= 0.0:
+                self.anim = 0.0
+                self.state = "closed"
+                self.timer = -1.0
+
+        # auto-close
+        if self.state == "open":
+            if self.timer > 0.0:
+                self.timer -= dt
+            if self.timer <= 0.0:
+                # prøv å lukke hvis mulig
+                if not self.any_actor_in_tile(enemies):
+                    self.state = "closing"
+                else:
+                    # blokkert – forsøk igjen når cellen blir ledig
+                    self.pending_close = True
+                    self.timer = -1.0
+
+        # hvis ventende lukking og cellen er ledig – lukk straks
+        if self.pending_close and self.state == "open" and not self.any_actor_in_tile(enemies):
+            self.state = "closing"
+            self.pending_close = False
+
+
+# Samling av dører i kartet
+doors: dict[tuple[int, int], Door] = {}
+
+
+# ---------- Prosedural tekstur (pygame.Surface) ----------
 def make_brick_texture() -> pygame.Surface:
     surf = pygame.Surface((TEX_W, TEX_H))
     surf.fill((150, 40, 40))
@@ -567,6 +694,155 @@ def dim_for_side(side: int) -> float:
     return 0.78 if side == 1 else 1.0
 
 def cast_and_build_wall_batches() -> dict[int, list[float]]:
+    # Ny implementasjon: lagrer bakvegg og dør uavhengig per kolonne, for korrekt perspektiv
+    batches_new: dict[int, list[float]] = {1: [], 2: [], 3: [], 4: [], 0: []}
+    for x in range(WIDTH):
+        camera_x = 2.0 * x / WIDTH - 1.0
+        ray_dir_x = dir_x + plane_x * camera_x
+        ray_dir_y = dir_y + plane_y * camera_x
+
+        map_x = int(player_x)
+        map_y = int(player_y)
+
+        delta_x = abs(1.0 / ray_dir_x) if ray_dir_x != 0 else 1e30
+        delta_y = abs(1.0 / ray_dir_y) if ray_dir_y != 0 else 1e30
+        if ray_dir_x < 0:
+            step_x = -1
+            side_x = (player_x - map_x) * delta_x
+        else:
+            step_x = 1
+            side_x = (map_x + 1.0 - player_x) * delta_x
+        if ray_dir_y < 0:
+            step_y = -1
+            side_y = (player_y - map_y) * delta_y
+        else:
+            step_y = 1
+            side_y = (map_y + 1.0 - player_y) * delta_y
+
+        door_hit = None  # {'dist','side','u','anim'}
+        wall_hit = None  # {'dist','side','u','tex'}
+
+        for _ in range(256):
+            if side_x < side_y:
+                side_x += delta_x
+                map_x += step_x
+                side = 0
+            else:
+                side_y += delta_y
+                map_y += step_y
+                side = 1
+            if not in_map(map_x, map_y):
+                break
+            cell = MAP[map_y][map_x]
+            if cell <= 0:
+                continue
+            # avstand og u
+            if side == 0:
+                dist = (map_x - player_x + (1 - step_x) / 2.0) / (ray_dir_x if ray_dir_x != 0 else 1e-9)
+                wx = player_y + dist * ray_dir_y
+            else:
+                dist = (map_y - player_y + (1 - step_y) / 2.0) / (ray_dir_y if ray_dir_y != 0 else 1e-9)
+                wx = player_x + dist * ray_dir_x
+            wx -= math.floor(wx)
+            u = wx
+            if (side == 0 and ray_dir_x > 0) or (side == 1 and ray_dir_y < 0):
+                u = 1.0 - u
+            if u <= TEX_EPS:
+                u = TEX_EPS
+            elif u >= 1.0 - TEX_EPS:
+                u = 1.0 - TEX_EPS
+
+            if cell == DOOR_TILE_ID:
+                d = doors.get((map_x, map_y))
+                p = d.anim if d else 0.0
+                if p >= 0.999:
+                    continue
+                if door_hit is None or dist < door_hit['dist']:
+                    door_hit = {
+                        'dist': dist,
+                        'side': side,
+                        'u': u,
+                        'anim': max(0.0, min(1.0, p)),
+                        'state': (d.state if d else 'opening'),
+                    }
+                continue
+            else:
+                wall_hit = {'dist': dist, 'side': side, 'u': u, 'tex': cell}
+                break
+
+        x_left, x_right = column_ndc(x)
+        # Bakvegg
+        if wall_hit is not None:
+            dist = wall_hit['dist']
+            sidew = wall_hit['side']
+            uw = wall_hit['u']
+            tex = wall_hit['tex']
+            lh = int(HEIGHT / (dist + 1e-6))
+            rs0 = -lh / 2.0 + HALF_H
+            re0 = rs0 + lh
+            ds = max(0, int(rs0))
+            de = min(HEIGHT - 1, int(re0))
+            top = y_ndc(ds)
+            bot = y_ndc(de)
+            v0 = (ds - rs0) / max(1.0, float(lh))
+            v1 = (de - rs0) / max(1.0, float(lh))
+            v0 = min(1.0 - TEX_EPS, max(TEX_EPS, v0))
+            v1 = min(1.0 - TEX_EPS, max(TEX_EPS, v1))
+            c = dim_for_side(sidew)
+            r = g = b = c
+            depth = clamp01(dist / FAR_PLANE)
+            arr = [
+                x_left,  top, uw, v0, r, g, b, depth,
+                x_left,  bot, uw, v1, r, g, b, depth,
+                x_right, top, uw, v0, r, g, b, depth,
+                x_right, top, uw, v0, r, g, b, depth,
+                x_left,  bot, uw, v1, r, g, b, depth,
+                x_right, bot, uw, v1, r, g, b, depth,
+            ]
+            batches_new.setdefault(tex, []).extend(arr)
+
+        # Dørpanel
+        if door_hit is not None:
+            dist = door_hit['dist']
+            sided = door_hit['side']
+            ud = door_hit['u']
+            p = door_hit['anim']
+            st = door_hit.get('state', 'opening')
+            lh = int(HEIGHT / (dist + 1e-6))
+            rs0 = -lh / 2.0 + HALF_H
+            re0 = rs0 + lh
+            if st == 'closing':
+                # Slide up: keep bottom fixed, erase from top as p decreases
+                rs = max(rs0, re0 - (1.0 - p) * lh)
+                re = re0
+            else:
+                # Opening: slide down, top moves down, bottom fixed
+                rs = min(re0, rs0 + p * lh)
+                re = re0
+            ds = max(0, int(rs))
+            de = min(HEIGHT - 1, int(re))
+            if ds < de:
+                top = y_ndc(ds)
+                bot = y_ndc(de)
+                # Texture slides with the panel: use a global offset of -p and allow wrapping.
+                # This makes the content translate downward during opening and upward during closing.
+                tex_off = -p
+                v0 = ((ds - rs0) / max(1.0, float(lh))) + tex_off
+                v1 = ((de - rs0) / max(1.0, float(lh))) + tex_off
+                c = dim_for_side(sided)
+                r = g = b = c
+                depth = clamp01(dist / FAR_PLANE)
+                arr = [
+                    x_left,  top, ud, v0, r, g, b, depth,
+                    x_left,  bot, ud, v1, r, g, b, depth,
+                    x_right, top, ud, v0, r, g, b, depth,
+                    x_right, top, ud, v0, r, g, b, depth,
+                    x_left,  bot, ud, v1, r, g, b, depth,
+                    x_right, bot, ud, v1, r, g, b, depth,
+                ]
+                batches_new.setdefault(DOOR_TEX_ID, []).extend(arr)
+
+    return batches_new
     batches: dict[int, list[float]] = {1: [], 2: [], 3: [], 4: []}
     for x in range(WIDTH):
         camera_x = 2.0 * x / WIDTH - 1.0
@@ -594,6 +870,10 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
         hit = 0
         side = 0
         tex_id = 1
+        door_progress = 0.0
+        door_state = None
+        # Data for "beyond" treff når døren er delvis åpen
+        beyond_hit = None  # tuple(perp_dist, u, side, tex_id)
         while hit == 0:
             if side_dist_x < side_dist_y:
                 side_dist_x += delta_dist_x
@@ -607,9 +887,21 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
                 hit = 1
                 tex_id = 1
                 break
-            if MAP[map_y][map_x] > 0:
-                hit = 1
-                tex_id = MAP[map_y][map_x]
+            cell = MAP[map_y][map_x]
+            if cell > 0:
+                # Dør: hvis fullstendig åpen – fortsett DDA gjennom cellen
+                if cell == DOOR_TILE_ID:
+                    d = doors.get((map_x, map_y))
+                    if d and d.anim >= 0.999:
+                        continue  # åpen – ingen kollisjon
+                    # ellers treff: rendres med tretekstur og klipp etter anim
+                    hit = 1
+                    tex_id = DOOR_TEX_ID
+                    door_progress = (d.anim if d else 0.0)
+                    door_state = (d.state if d else None)
+                else:
+                    hit = 1
+                    tex_id = cell
 
         if side == 0:
             perp_wall_dist = (map_x - player_x + (1 - step_x) / 2.0) / (ray_dir_x if ray_dir_x != 0 else 1e-9)
@@ -624,13 +916,36 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
             u = 1.0 - u
 
         line_height = int(HEIGHT / (perp_wall_dist + 1e-6))
-        draw_start = max(0, -line_height // 2 + HALF_H)
-        draw_end = min(HEIGHT - 1, line_height // 2 + HALF_H)
+        raw_start0 = -line_height / 2.0 + HALF_H
+        raw_end0 = raw_start0 + line_height
+
+        # Dør: synker ned ved åpning, vokser nedefra ved lukking
+        raw_start = raw_start0
+        raw_end = raw_end0
+        if door_state is not None:
+            p = max(0.0, min(1.0, door_progress))
+            if door_state in ("opening", "open"):
+                # toppen flyttes nedover med p
+                raw_start = min(raw_end0, raw_start0 + p * line_height)
+                raw_end = raw_end0
+            elif door_state == "closing":
+                # toppen flyttes oppover fra bunnen
+                visible_h = (1.0 - p) * line_height
+                raw_start = max(raw_start0, raw_end0 - visible_h)
+                raw_end = raw_end0
+        # Klipp til skjerm
+        draw_start = max(0, int(raw_start))
+        draw_end = min(HEIGHT - 1, int(raw_end))
 
         x_left, x_right = column_ndc(x)
         top_ndc = y_ndc(draw_start)
         bot_ndc = y_ndc(draw_end)
 
+        # v-koordinater: måles alltid relativt til full høyde (raw_start0)
+        v0 = (draw_start - raw_start0) / max(1.0, float(line_height))
+        v1 = (draw_end - raw_start0) / max(1.0, float(line_height))
+        v0 = min(1.0 - TEX_EPS, max(TEX_EPS, v0))
+        v1 = min(1.0 - TEX_EPS, max(TEX_EPS, v1))
         c = dim_for_side(side)
         r = g = b = c
         depth = clamp01(perp_wall_dist / FAR_PLANE)
@@ -644,6 +959,115 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
             x_right, bot_ndc, u, 1.0, r, g, b, depth,
         ]
         batches.setdefault(tex_id, []).extend(v)
+
+        # Under animasjon – tegn vegg/rom bak i åpningen (se gjennom), samt en tynn toppstripe
+        # i gulvfarge for dørens overside ved åpning/lukking.
+        if door_state in ("opening", "closing") and (door_progress > 0.0) and (door_progress < 0.999):
+            # Fortsett DDA rett bak døren
+            t_offset = max(0.0, perp_wall_dist) + 1e-4
+            ox = player_x + ray_dir_x * t_offset
+            oy = player_y + ray_dir_y * t_offset
+            mx = int(ox)
+            my = int(oy)
+            ddx = abs(1.0 / ray_dir_x) if ray_dir_x != 0 else 1e30
+            ddy = abs(1.0 / ray_dir_y) if ray_dir_y != 0 else 1e30
+            if ray_dir_x < 0:
+                stepx2 = -1
+                sdx2 = (ox - mx) * ddx
+            else:
+                stepx2 = 1
+                sdx2 = (mx + 1.0 - ox) * ddx
+            if ray_dir_y < 0:
+                stepy2 = -1
+                sdy2 = (oy - my) * ddy
+            else:
+                stepy2 = 1
+                sdy2 = (my + 1.0 - oy) * ddy
+            side2 = 0
+            hit2 = False
+            tex2 = 1
+            for _ in range(128):
+                if sdx2 < sdy2:
+                    sdx2 += ddx
+                    mx += stepx2
+                    side2 = 0
+                else:
+                    sdy2 += ddy
+                    my += stepy2
+                    side2 = 1
+                if not in_map(mx, my):
+                    break
+                cell2 = MAP[my][mx]
+                if cell2 > 0:
+                    if cell2 == DOOR_TILE_ID:
+                        d2 = doors.get((mx, my))
+                        if d2 and d2.anim >= 0.999:
+                            continue
+                        tex2 = DOOR_TEX_ID
+                        hit2 = True
+                    else:
+                        tex2 = cell2
+                        hit2 = True
+                if hit2:
+                    if side2 == 0:
+                        perp2 = (mx - ox + (1 - stepx2) / 2.0) / (ray_dir_x if ray_dir_x != 0 else 1e-9)
+                        wallx2 = oy + perp2 * ray_dir_y
+                    else:
+                        perp2 = (my - oy + (1 - stepy2) / 2.0) / (ray_dir_y if ray_dir_y != 0 else 1e-9)
+                        wallx2 = ox + perp2 * ray_dir_x
+                    wallx2 -= math.floor(wallx2)
+                    u2 = wallx2
+                    if (side2 == 0 and ray_dir_x > 0) or (side2 == 1 and ray_dir_y < 0):
+                        u2 = 1.0 - u2
+                    u2 = min(1.0 - TEX_EPS, max(TEX_EPS, u2))
+
+                    line2 = int(HEIGHT / (perp2 + 1e-6))
+                    raw_s20 = -line2 / 2.0 + HALF_H
+                    raw_e20 = raw_s20 + line2
+                    dstart2 = max(0, int(raw_s20))
+                    dend2 = min(HEIGHT - 1, int(raw_e20))
+
+                    # Tegn HELE bakvegg-kolonnen; dørpanelet vil occludere korrekt via depth
+                    top2 = y_ndc(dstart2)
+                    bot2 = y_ndc(dend2)
+                    c2 = dim_for_side(side2)
+                    r2 = g2 = b2 = c2
+                    depth2 = clamp01(perp2 / FAR_PLANE)
+                    v0_2 = (dstart2 - raw_s20) / max(1.0, float(line2))
+                    v1_2 = (dend2 - raw_s20) / max(1.0, float(line2))
+                    v0_2 = min(1.0 - TEX_EPS, max(TEX_EPS, v0_2))
+                    v1_2 = min(1.0 - TEX_EPS, max(TEX_EPS, v1_2))
+                    vv = [
+                        x_left,  top2, u2, v0_2, r2, g2, b2, depth2,
+                        x_left,  bot2, u2, v1_2, r2, g2, b2, depth2,
+                        x_right, top2, u2, v0_2, r2, g2, b2, depth2,
+                        x_right, top2, u2, v0_2, r2, g2, b2, depth2,
+                        x_left,  bot2, u2, v1_2, r2, g2, b2, depth2,
+                        x_right, bot2, u2, v1_2, r2, g2, b2, depth2,
+                    ]
+                    batches.setdefault(tex2 if tex2 in (1,2,3,4) else DOOR_TEX_ID, []).extend(vv)
+                    break
+
+            # Toppflate (tynn stripe) i gulvfarge ved dørens nåværende topp
+            if draw_start > 0:
+                top_strip = 2
+                y0p = max(0, draw_start - top_strip)
+                y1p = draw_start
+                x0 = x_left
+                x1 = x_right
+                y0 = y_ndc(y0p)
+                y1 = y_ndc(y1p)
+                r3, g3, b3 = (35/255.0, 35/255.0, 35/255.0)
+                d3 = depth
+                vv2 = [
+                    x0, y0, 0.0, 0.0, r3, g3, b3, d3,
+                    x0, y1, 0.0, 1.0, r3, g3, b3, d3,
+                    x1, y0, 1.0, 0.0, r3, g3, b3, d3,
+                    x1, y0, 1.0, 0.0, r3, g3, b3, d3,
+                    x0, y1, 0.0, 1.0, r3, g3, b3, d3,
+                    x1, y1, 1.0, 1.0, r3, g3, b3, d3,
+                ]
+                batches.setdefault(0, []).extend(vv2)
     return batches
 
 def build_fullscreen_background() -> np.ndarray:
@@ -797,7 +1221,13 @@ def build_weapon_overlay(firing: bool, recoil_t: float) -> np.ndarray:
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
 def build_minimap_quads(enemies: list['Enemy']) -> np.ndarray:
-    """Liten GL-basert minimap øverst til venstre – nå med fiender."""
+    """Liten GL-basert minimap øverst til venstre.
+    - Dører: blå
+    - Tilgjengelige vegger: hvit/grå
+    - Sett men utilgjengelig: lysegrå prikker
+    - Usett utilgjengelig: ikke rendres
+    """
+    global seen_tiles
     scale = 6
     mm_w = MAP_W * scale
     mm_h = MAP_H * scale
@@ -820,14 +1250,46 @@ def build_minimap_quads(enemies: list['Enemy']) -> np.ndarray:
             x1, y1, 1.0, 1.0, r, g, b, depth,
         ])
 
+    def add_dot_px(cx_px, cy_px, col, depth):
+        # liten prikk 2x2 px sentrert i cellen
+        r, g, b = col
+        x_px = cx_px - 1
+        y_px = cy_px - 1
+        add_quad_px(x_px, y_px, 2, 2, col, depth)
+
     # Bakgrunn
     add_quad_px(pad-2, pad-2, mm_w+4, mm_h+4, (0.1, 0.1, 0.1), 0.0)
 
-    # Veggceller
+    # Finn tilgjengelige fliser nå og oppdater 'seen'
+    reachable = compute_reachable()
+    seen_tiles |= reachable
+
+    def any_neighbor_in(s: set[tuple[int,int]], x: int, y: int) -> bool:
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            if (x+dx, y+dy) in s:
+                return True
+        return False
+
+    door_blue = (0.2, 0.6, 1.0)
+    wall_white = (0.86, 0.86, 0.86)
+    seen_dot = (0.7, 0.7, 0.7)
+
     for y in range(MAP_H):
         for x in range(MAP_W):
-            if MAP[y][x] > 0:
-                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, (0.86, 0.86, 0.86), 0.0)
+            cell = MAP[y][x]
+            if cell <= 0:
+                continue
+            accessible = any_neighbor_in(reachable, x, y)
+            if not accessible:
+                if any_neighbor_in(seen_tiles, x, y):
+                    cx = pad + x*scale + (scale//2)
+                    cy = pad + y*scale + (scale//2)
+                    add_dot_px(cx, cy, seen_dot, 0.0)
+                continue
+            if cell == DOOR_TILE_ID:
+                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, door_blue, 0.0)
+            else:
+                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, wall_white, 0.0)
 
     # Spiller
     px = int(player_x * scale)
@@ -893,6 +1355,55 @@ def handle_input(dt: float, controls_enabled: bool) -> None:
         ny = player_y + (dir_x) * strafe
         player_x, player_y = try_move(nx, ny)
 
+def find_door_ahead(max_dist: float = 3.0) -> tuple[int, int] | None:
+    # Enkel DDA i sikteretning: finn nærmeste dørcelle i front
+    ray_dir_x = dir_x
+    ray_dir_y = dir_y
+    map_x = int(player_x)
+    map_y = int(player_y)
+    delta_dist_x = abs(1.0 / ray_dir_x) if ray_dir_x != 0 else 1e30
+    delta_dist_y = abs(1.0 / ray_dir_y) if ray_dir_y != 0 else 1e30
+    if ray_dir_x < 0:
+        step_x = -1
+        side_dist_x = (player_x - map_x) * delta_dist_x
+    else:
+        step_x = 1
+        side_dist_x = (map_x + 1.0 - player_x) * delta_dist_x
+    if ray_dir_y < 0:
+        step_y = -1
+        side_dist_y = (player_y - map_y) * delta_dist_y
+    else:
+        step_y = 1
+        side_dist_y = (map_y + 1.0 - player_y) * delta_dist_y
+    dist = 0.0
+    while dist <= max_dist:
+        if side_dist_x < side_dist_y:
+            dist = side_dist_x
+            side_dist_x += delta_dist_x
+            map_x += step_x
+        else:
+            dist = side_dist_y
+            side_dist_y += delta_dist_y
+            map_y += step_y
+        if not in_map(map_x, map_y):
+            return None
+        if MAP[map_y][map_x] == DOOR_TILE_ID:
+            return (map_x, map_y)
+        # Stopp på ordinær vegg, ikke skyt gjennom
+        if MAP[map_y][map_x] > 0:
+            return None
+    return None
+
+def try_open_door() -> None:
+    # Finn nærmeste dør i blikkretning og be om åpning
+    target = find_door_ahead(max_dist=3.5)
+    if target is None:
+        return
+    d = doors.get(target)
+    if d:
+        d.request_open()
+        print("[Door] Try open", target)
+
 # ---------- Main ----------
 def main() -> None:
     global player_x, player_y
@@ -929,12 +1440,58 @@ def main() -> None:
         Enemy(16.5, 6.5),
     ]
 
-    # Spawning-tilstand (TIKKER HVER FRAME – flyttet ut av event-loopen)
-    spawn_interval = SPAWN_INTERVAL_START
-    spawn_timer = 2.0  # liten oppstarts-delay før første spawn
+    # Init dører i kartet og minimap
+    MAP[DOOR_Y][DOOR_X] = DOOR_TILE_ID
+    doors[(DOOR_X, DOOR_Y)] = Door(DOOR_X, DOOR_Y)
+    global seen_tiles
+    seen_tiles |= compute_reachable()
 
+    # Spawning-tilstand (tikker hver frame)
+    spawn_interval = SPAWN_INTERVAL_START
+    spawn_timer = 2.0
+
+    # Mus-capture (synlig cursor + crosshair)
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(True)
+
+    # Hint overlay: press Z to open doors (drawn for a few seconds at start)
+    tip_timer = 5.0
+    try:
+        pygame.font.init()
+        font = pygame.font.SysFont(None, 22)
+    except Exception:
+        font = None
+    tip_tex = None
+    tip_verts = None
+    if font is not None:
+        msg = "Trykk Z for å åpne/lukke dører"
+        # Yellow text on transparent background
+        text_surf = font.render(msg, True, (255, 230, 0))
+        tex_w, tex_h = text_surf.get_width(), text_surf.get_height()
+        tip_tex = surface_to_texture(
+            text_surf,
+            gl.GL_LINEAR, gl.GL_LINEAR,
+            gl.GL_CLAMP_TO_EDGE, gl.GL_CLAMP_TO_EDGE,
+        )
+        # Build quad verts centered at top with small margin
+        x = (WIDTH - tex_w) // 2
+        y = 10
+        x0 = (2.0 * x) / WIDTH - 1.0
+        x1 = (2.0 * (x + tex_w)) / WIDTH - 1.0
+        y0 = 1.0 - 2.0 * (y / HEIGHT)
+        y1 = 1.0 - 2.0 * ((y + tex_h) / HEIGHT)
+        r = g = b = 1.0
+        depth = 0.0
+        # Flip V so text renders upright
+        tip_verts = np.asarray([
+            x0, y0, 0.0, 1.0, r, g, b, depth,
+            x0, y1, 0.0, 0.0, r, g, b, depth,
+            x1, y0, 1.0, 1.0, r, g, b, depth,
+
+            x1, y0, 1.0, 1.0, r, g, b, depth,
+            x0, y1, 0.0, 0.0, r, g, b, depth,
+            x1, y1, 1.0, 0.0, r, g, b, depth,
+        ], dtype=np.float32).reshape((-1, 8))
 
     running = True
     while running:
@@ -956,6 +1513,8 @@ def main() -> None:
                     player_bullets.append(Bullet(bx, by, dir_x * speed, dir_y * speed, friendly=True))
                     firing = True
                     recoil_t = 0.0
+                if event.key == pygame.K_z:
+                    try_open_door()
             elif not GAME_OVER and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 bx = player_x + dir_x * 0.4
                 by = player_y + dir_y * 0.4
@@ -1023,6 +1582,10 @@ def main() -> None:
                     if player_hp <= 0:
                         GAME_OVER = True
         enemy_bullets = [b for b in enemy_bullets if b.alive]
+
+        # Oppdater dør(er)
+        for d in doors.values():
+            d.update(dt, enemies)
 
         # ---------- Render ----------
         gl.glViewport(0, 0, WIDTH, HEIGHT)
@@ -1094,6 +1657,11 @@ def main() -> None:
                 [ 1, -1, 1,1, 0.0,0.0,0.0, 0.0],
             ], dtype=np.float32)
             renderer.draw_arrays(verts, renderer.white_tex, use_tex=False)
+
+        # Tip overlay
+        if tip_timer > 0 and tip_tex is not None and tip_verts is not None:
+            tip_timer -= dt
+            renderer.draw_arrays(tip_verts, tip_tex, use_tex=True)
 
         pygame.display.flip()
 
