@@ -50,6 +50,8 @@ STRAFE_SPEED = 2.5
 
 # Tekstur-størrelse brukt på GPU (proseduralt generert)
 TEX_W = TEX_H = 256
+# Små epsilon-verdier for å unngå sampling helt i ytterkant av teksturer
+TEX_EPS = 0.0005
 
 # Depth mapping (lineær til [0..1] for gl_FragDepth)
 FAR_PLANE = 100.0
@@ -283,24 +285,37 @@ def make_program(vs_src: str, fs_src: str) -> int:
         raise RuntimeError(f"Program link error:\n{log}")
     return prog
 
-def surface_to_texture(surf: pygame.Surface) -> int:
-    """Laster pygame.Surface til GL_TEXTURE_2D (RGBA8). Returnerer texture id."""
+def surface_to_texture(surf: pygame.Surface, *, wrap: str = "repeat", filter_mode: str | None = None) -> int:
+    """Laster pygame.Surface til GL_TEXTURE_2D (RGBA8). Returnerer texture id.
+    wrap: 'repeat' for vegger (tile), 'clamp' for sprites/overlays.
+    """
     data = pygame.image.tostring(surf.convert_alpha(), "RGBA", True)
     w, h = surf.get_width(), surf.get_height()
     tid = gl.glGenTextures(1)
     gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
+    # Velg filtrering: for vegger gir NEAREST færre smear-artefakter ved 1px striper
+    if filter_mode is None:
+        filter_mode = "nearest" if wrap == "repeat" else "linear"
+    if filter_mode == "nearest":
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+    else:
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+    if wrap == "clamp":
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+    else:
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
     return tid
 
 def make_white_texture() -> int:
     surf = pygame.Surface((1, 1), pygame.SRCALPHA)
     surf.fill((255, 255, 255, 255))
-    return surface_to_texture(surf)
+    return surface_to_texture(surf, wrap="clamp", filter_mode="linear")
 
 def make_enemy_texture() -> pygame.Surface:
     s = pygame.Surface((256, 256), pygame.SRCALPHA)
@@ -378,7 +393,7 @@ class GLRenderer:
     def _load_texture_file(self, path: str, size: int = 512) -> int:
         surf = pygame.image.load(path).convert_alpha()
         surf = self._scale_if_needed(surf, size)
-        return surface_to_texture(surf)
+        return surface_to_texture(surf, wrap="repeat", filter_mode="nearest")
 
     # ---------- offentlig laster ----------
 
@@ -440,7 +455,7 @@ class GLRenderer:
                 print(
                     f"[GLRenderer]  - rescale {surf.get_width()}x{surf.get_height()} -> {size}x{size}")
                 surf = pygame.transform.smoothscale(surf, (size, size))
-            tex_id = surface_to_texture(surf)
+            tex_id = surface_to_texture(surf, wrap="repeat")
             print(f"[GLRenderer]  - OK (GL tex id {tex_id})")
             return tex_id
 
@@ -450,7 +465,8 @@ class GLRenderer:
         self.textures[4] = _load(files[4], 512)
 
         # Sprite (kule) – behold prosedyre
-        self.textures[99] = surface_to_texture(make_bullet_texture())
+        # bullet sprite har alpha: bruk clamp for å unngå fringe/bleed
+        self.textures[99] = surface_to_texture(make_bullet_texture(), wrap="clamp")
 
         # Enemy sprite (ID 200): prøv fil, ellers prosedyral placeholder
         try:
@@ -462,22 +478,28 @@ class GLRenderer:
                 print(f"[GLRenderer] Enemy OK (GL tex id {self.textures[200]})")
             else:
                 # fallback – prosedural fiende
-                self.textures[200] = surface_to_texture(make_enemy_texture())
+                self.textures[200] = surface_to_texture(make_enemy_texture(), wrap="clamp")
                 print("[GLRenderer] Enemy: bruker prosedural sprite")
         except Exception as ex:
             print(f"[GLRenderer] Enemy: FEIL ved lasting ({ex}), bruker prosedural")
-            self.textures[200] = surface_to_texture(make_enemy_texture())
+            self.textures[200] = surface_to_texture(make_enemy_texture(), wrap="clamp")
 
         print("[GLRenderer] Teksturer lastet.\n")
 
     # ---------- draw ----------
-    def draw_arrays(self, verts: np.ndarray, texture: int, use_tex: bool) -> None:
+    def draw_arrays(self, verts: np.ndarray, texture: int, use_tex: bool, *, alpha: bool = True) -> None:
         if verts.size == 0:
             return
         gl.glUseProgram(self.prog)
         gl.glUniform1i(self.uni_use_tex, 1 if use_tex else 0)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, texture if use_tex else self.white_tex)
+
+        # For vegger/opaque overlay deaktiver blending for å unngå kant-artefakter
+        if alpha:
+            gl.glEnable(gl.GL_BLEND)
+        else:
+            gl.glDisable(gl.GL_BLEND)
 
         gl.glBindVertexArray(self.vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
@@ -492,6 +514,12 @@ def column_ndc(x: int) -> tuple[float, float]:
     """Returnerer venstre/høyre NDC-X for en 1-px bred skjermkolonne."""
     x_left = (2.0 * x) / WIDTH - 1.0
     x_right = (2.0 * (x + 1)) / WIDTH - 1.0
+    # Unngå å lande eksakt på -1/1 for å forhindre rasteriseringsartefakter på vinduskant
+    edge_eps = 1.0 / float(WIDTH)  # ~1px in NDC space
+    if x == 0:
+        x_left += edge_eps * 0.25
+    if x == WIDTH - 1:
+        x_right -= edge_eps * 0.25
     return x_left, x_right
 
 def y_ndc(y_pix: int) -> float:
@@ -560,16 +588,32 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
         u = wall_x
         if (side == 0 and ray_dir_x > 0) or (side == 1 and ray_dir_y < 0):
             u = 1.0 - u
+        # Unngå sampling helt i kantene (0/1) for å redusere "dragging" pga. lineær filtrering
+        if u <= TEX_EPS:
+            u = TEX_EPS
+        elif u >= 1.0 - TEX_EPS:
+            u = 1.0 - TEX_EPS
 
         # skjermhøyde på vegg
         line_height = int(HEIGHT / (perp_wall_dist + 1e-6))
-        draw_start = max(0, -line_height // 2 + HALF_H)
-        draw_end = min(HEIGHT - 1, line_height // 2 + HALF_H)
+        raw_start = -line_height / 2.0 + HALF_H
+        raw_end = raw_start + line_height
+        # Klipp til skjerm
+        draw_start = max(0, int(raw_start))
+        draw_end = min(HEIGHT - 1, int(raw_end))
 
         # NDC koordinater for 1-px bred stripe
         x_left, x_right = column_ndc(x)
         top_ndc = y_ndc(draw_start)
         bot_ndc = y_ndc(draw_end)
+
+        # v-koordinater må reflektere klipp slik at teksturen fortsetter riktig
+        # v0/v1 er hvor den synlige delen ligger innenfor hele veggkolonnen
+        v0 = (draw_start - raw_start) / max(1.0, float(line_height))
+        v1 = (draw_end - raw_start) / max(1.0, float(line_height))
+        # klem til [0,1] og unngå helt i kantene
+        v0 = min(1.0 - TEX_EPS, max(TEX_EPS, v0))
+        v1 = min(1.0 - TEX_EPS, max(TEX_EPS, v1))
 
         # Farge-dim (samme på hele kolonnen)
         c = dim_for_side(side)
@@ -582,13 +626,13 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
         # [x, y, u, v, r, g, b, depth]
         v = [
             # tri 1
-            x_left,  top_ndc, u, 0.0, r, g, b, depth,
-            x_left,  bot_ndc, u, 1.0, r, g, b, depth,
-            x_right, top_ndc, u, 0.0, r, g, b, depth,
+            x_left,  top_ndc, u, v0, r, g, b, depth,
+            x_left,  bot_ndc, u, v1, r, g, b, depth,
+            x_right, top_ndc, u, v0, r, g, b, depth,
             # tri 2
-            x_right, top_ndc, u, 0.0, r, g, b, depth,
-            x_left,  bot_ndc, u, 1.0, r, g, b, depth,
-            x_right, bot_ndc, u, 1.0, r, g, b, depth,
+            x_right, top_ndc, u, v0, r, g, b, depth,
+            x_left,  bot_ndc, u, v1, r, g, b, depth,
+            x_right, bot_ndc, u, v1, r, g, b, depth,
         ]
         batches.setdefault(tex_id, []).extend(v)
     return batches
@@ -994,7 +1038,7 @@ def main() -> None:
 
         # Bakgrunn (himmel/gulv)
         bg = build_fullscreen_background()
-        renderer.draw_arrays(bg, renderer.white_tex, use_tex=False)
+        renderer.draw_arrays(bg, renderer.white_tex, use_tex=False, alpha=False)
 
         # Vegger (batch pr. tex_id)
         batches_lists = cast_and_build_wall_batches()
@@ -1004,21 +1048,21 @@ def main() -> None:
             if not verts_list:
                 continue
             arr = np.asarray(verts_list, dtype=np.float32).reshape((-1, 8))
-            renderer.draw_arrays(arr, renderer.textures[tid], use_tex=True)
+            renderer.draw_arrays(arr, renderer.textures[tid], use_tex=True, alpha=False)
 
         # Sprites (kuler)
         spr = build_sprites_batch(bullets)
         if spr.size:
-            renderer.draw_arrays(spr, renderer.textures[99], use_tex=True)
+            renderer.draw_arrays(spr, renderer.textures[99], use_tex=True, alpha=True)
 
         # Enemies (billboards)
         enemies_batch = build_enemies_batch(enemies)
         if enemies_batch.size:
-            renderer.draw_arrays(enemies_batch, renderer.textures[200], use_tex=True)
+            renderer.draw_arrays(enemies_batch, renderer.textures[200], use_tex=True, alpha=True)
 
         # Crosshair
         cross = build_crosshair_quads(8, 2)
-        renderer.draw_arrays(cross, renderer.white_tex, use_tex=False)
+        renderer.draw_arrays(cross, renderer.white_tex, use_tex=False, alpha=False)
 
         # Weapon overlay
         if firing:
@@ -1026,11 +1070,11 @@ def main() -> None:
             if recoil_t > 0.15:
                 firing = False
         overlay = build_weapon_overlay(firing, recoil_t)
-        renderer.draw_arrays(overlay, renderer.white_tex, use_tex=False)
+        renderer.draw_arrays(overlay, renderer.white_tex, use_tex=False, alpha=False)
 
         # Minimap
         mm = build_minimap_quads()
-        renderer.draw_arrays(mm, renderer.white_tex, use_tex=False)
+        renderer.draw_arrays(mm, renderer.white_tex, use_tex=False, alpha=False)
 
         pygame.display.flip()
 
