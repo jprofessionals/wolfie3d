@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
 """
-Vibe Wolf (Python + PyOpenGL) — GL-renderer (fiender skyter)
-------------------------------------------------------------
-- Fiender skyter mot spilleren når de er nærme (attack-state).
-- Player HP og hit-flash.
-- Resten (vegger/kuler/minimap) som før.
-- Random spawning: flyttet ut av event-loopen (tikker hver frame).
+Vibe Wolf (Python + PyOpenGL) — GL-renderer
+-------------------------------------------
+Denne varianten beholder logikken (kart, DDA-raycasting, input, sprites),
+men tegner ALT med OpenGL (GPU). Vegger og sprites blir teksturerte quads,
+og vi bruker depth-test i GPU for korrekt okklusjon (ingen CPU zbuffer).
+
+Avhengigheter:
+  - pygame >= 2.1 (for vindu/input)
+  - PyOpenGL, PyOpenGL-accelerate
+  - numpy
+
+Kjør:
+  python wolfie3d_gl.py
+
+Taster:
+  - WASD / piltaster: bevegelse
+  - Q/E eller ← → : rotasjon
+  - SPACE / venstre mus: skyte
+  - ESC: avslutt
 """
 
 from __future__ import annotations
 
 import math
+import random
 import sys
 from typing import TYPE_CHECKING
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import pygame
 from OpenGL import GL as gl
 
-import random
-
-
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # kun for typing hints
     from collections.abc import Sequence
 
 # ---------- Konfig ----------
@@ -36,34 +45,17 @@ FOV = 66 * math.pi / 180.0
 PLANE_LEN = math.tan(FOV / 2)
 
 # Bevegelse
-MOVE_SPEED = 3.0
-ROT_SPEED = 2.0
+MOVE_SPEED = 3.0      # enheter/sek
+ROT_SPEED = 2.0       # rad/sek
 STRAFE_SPEED = 2.5
 
-# Tekstur-størrelse (for vegger)
+# Tekstur-størrelse brukt på GPU (proseduralt generert)
 TEX_W = TEX_H = 256
 
-# Depth mapping
+# Depth mapping (lineær til [0..1] for gl_FragDepth)
 FAR_PLANE = 100.0
 
-# Sprites
-SPRITE_FRAME = 128
-SPRITE_V_FLIP = True
-ENEMY_BASE_SCALE = 1.0
-
-# Spiller
-PLAYER_RADIUS = 0.35
-PLAYER_MAX_HP = 100
-
-# Spawning (økt litt på MAX for å se flere samtidig)
-MAX_LIVE_ENEMIES       = 8         # <-- endret fra 5
-SPAWN_INTERVAL_START   = 6.0
-SPAWN_INTERVAL_MIN     = 2.0
-SPAWN_INTERVAL_FACTOR  = 0.95
-SPAWN_MIN_DIST_TO_PLAYER = 6.0
-RANDOM_SEED            = None
-
-# Kart
+# Kart (0=tomt, >0=veggtype/tekstur-id)
 MAP: list[list[int]] = [
     [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
     [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
@@ -78,9 +70,9 @@ MAP: list[list[int]] = [
     [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
     [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
     [1,0,2,2,2,2,2,0,0,0,0,3,3,3,0,0,4,4,4,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
-    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,0,0,0,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,0,0,0,1],
+    [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,0,0,0,1],
     [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
     [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
     [1,0,0,0,0,0,2,0,0,0,0,3,0,0,0,0,4,0,0,1],
@@ -89,7 +81,7 @@ MAP: list[list[int]] = [
 MAP_W = len(MAP[0])
 MAP_H = len(MAP)
 
-# Startpos
+# Startpos og retning
 player_x = 3.5
 player_y = 10.5
 dir_x, dir_y = 1.0, 0.0
@@ -102,42 +94,18 @@ def in_map(ix: int, iy: int) -> bool:
 def is_wall(ix: int, iy: int) -> bool:
     return in_map(ix, iy) and MAP[iy][ix] > 0
 
-def live_enemy_count(enemies: list['Enemy']) -> int:
-    return sum(1 for e in enemies if not e.remove)
-
-def is_empty_cell(ix: int, iy: int) -> bool:
-    return in_map(ix, iy) and MAP[iy][ix] == 0
-
-def distance(ax: float, ay: float, bx: float, by: float) -> float:
-    return math.hypot(ax - bx, ay - by)
-
-def random_spawn_pos(max_tries: int = 200) -> tuple[float, float] | None:
-    """
-    Finn et tilfeldig spawnpunkt i kartet (tom celle, langt nok fra spiller).
-    """
-    for _ in range(max_tries):
-        ix = random.randint(1, MAP_W - 2)
-        iy = random.randint(1, MAP_H - 2)
-        if not is_empty_cell(ix, iy):
-            continue
-        cx = ix + 0.5 + random.uniform(-0.2, 0.2)
-        cy = iy + 0.5 + random.uniform(-0.2, 0.2)
-        if distance(cx, cy, player_x, player_y) < SPAWN_MIN_DIST_TO_PLAYER:
-            continue
-        return (cx, cy)
-    return None
-
 def clamp01(x: float) -> float:
-    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+    if x < 0.0: return 0.0
+    if x > 1.0: return 1.0
+    return x
 
 # ---------- Prosjektil ----------
 class Bullet:
-    def __init__(self, x: float, y: float, vx: float, vy: float, friendly: bool) -> None:
+    def __init__(self, x: float, y: float, vx: float, vy: float) -> None:
         self.x = x
         self.y = y
         self.vx = vx
         self.vy = vy
-        self.friendly = friendly  # True=spiller, False=fiende
         self.alive = True
         self.age = 0.0
         self.height_param = 0.2  # 0..~0.65 (stiger visuelt)
@@ -154,44 +122,18 @@ class Bullet:
         self.age += dt
         self.height_param = min(0.65, self.height_param + 0.35 * dt)
 
-# ---------- Enemy sprites / sheets ----------
-@dataclass
-class SpriteSheet:
-    tex_id: int
-    sheet_w: int
-    sheet_h: int
-    frame_w: int
-    frame_h: int
-    frames: int
-    fps: float
-    loop: bool
-
 # ---------- Fiende ----------
 class Enemy:
     def __init__(self, x: float, y: float) -> None:
         self.x = x
         self.y = y
+        self.alive = True
         self.radius = 0.35
         self.speed = 1.4
         self.height_param = 0.5
-        self.walk_t = 0.0
-        self._last_pos = (x, y)
-
-        # state/animasjon
-        self.state = "idle"
-        self.state_t = 0.0
-        self.hp = 1
-        self.dying = False
-        self.remove = False
-        self.attack_cooldown = 0.0
-        self.fired_in_attack = False  # viktig: ett skudd per attack-anim
-
-    def set_state(self, s: str) -> None:
-        if self.state != s:
-            self.state = s
-            self.state_t = 0.0
-            if s == "attack":
-                self.fired_in_attack = False
+        # --- new ---
+        self.dying = False           # when True, show happy sprite, then vanish
+        self.happy_timer = 0.0       # seconds remaining of happy pose
 
     def _try_move(self, nx: float, ny: float) -> None:
         if not is_wall(int(nx), int(self.y)):
@@ -199,176 +141,60 @@ class Enemy:
         if not is_wall(int(self.x), int(ny)):
             self.y = ny
 
-    def hit(self) -> None:
-        if self.dying or self.remove:
+    def update(self, dt: float) -> None:
+        if not self.alive:
             return
-        self.hp -= 1
-        if self.hp <= 0:
-            self.dying = True
-            self.set_state("dead")
-        else:
-            self.set_state("hurt")
-
-    def _maybe_fire(self, sheets: dict[str, SpriteSheet], enemy_bullets: list[Bullet]) -> None:
-        """Avfyre ett skudd midt i attack-animasjonen."""
-        if self.fired_in_attack:
-            return
-        sh = sheets.get("attack")
-        trigger_t = 0.25
-        if sh:
-            trigger_t = (sh.frames / max(1.0, sh.fps)) * 0.45
-        if self.state_t >= trigger_t:
-            dx = player_x - self.x
-            dy = player_y - self.y
-            dist = math.hypot(dx, dy) + 1e-9
-            ux, uy = dx / dist, dy / dist
-            speed = 8.5
-            bx = self.x + ux * 0.35
-            by = self.y + uy * 0.35
-            enemy_bullets.append(Bullet(bx, by, ux * speed, uy * speed, friendly=False))
-            self.fired_in_attack = True
-
-    def update(self, dt: float, sheets: dict[str, SpriteSheet], enemy_bullets: list[Bullet]) -> None:
-        self.state_t += dt
-
-        # Død
+        # If in happy state, count down and don't move
         if self.dying:
-            sh = sheets.get("dead")
-            if sh and not sh.loop:
-                total = (sh.frames / max(1.0, sh.fps))
-                if self.state_t >= total:
-                    self.remove = True
+            self.happy_timer -= dt
+            if self.happy_timer <= 0.0:
+                self.alive = False
             return
 
-        # Chase
+        # normal chase
         dx = player_x - self.x
         dy = player_y - self.y
         dist = math.hypot(dx, dy) + 1e-9
-
-        moved = 0.0
         if dist > 0.75:
             ux, uy = dx / dist, dy / dist
             step = self.speed * dt
-            oldx, oldy = self.x, self.y
             self._try_move(self.x + ux * step, self.y + uy * step)
-            moved = math.hypot(self.x - oldx, self.y - oldy)
 
-        # Gå-bobbing
-        if moved > 1e-4:
-            self.walk_t = (self.walk_t + moved * 2.5) % 1.0
 
-        # Attack hvis nærme
-        self.attack_cooldown = max(0.0, self.attack_cooldown - dt)
-        close = dist < 2.7
-        if close and self.attack_cooldown <= 0.0 and not self.dying:
-            if self.state != "attack":
-                self.set_state("attack")
-            self._maybe_fire(sheets, enemy_bullets)
+def make_cv_stack_surface() -> pygame.Surface:
+    """Small stack of CV papers for pickups (RGBA)."""
+    W, H = 256, 256
+    s = pygame.Surface((W, H), pygame.SRCALPHA)
+    s.fill((0, 0, 0, 0))
 
-        # Avslutt attack etter animasjonens lengde
-        if self.state == "attack":
-            sh = sheets.get("attack")
-            dur = (sh.frames / max(1.0, sh.fps)) if sh else 0.35
-            if self.state_t >= dur:
-                self.set_state("walk" if moved > 1e-4 else "idle")
-                self.attack_cooldown = 1.2
+    # soft shadow
+    sh = pygame.Surface((W, H), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 90), (60, 190, 136, 34))
+    s.blit(sh, (0, 0))
 
-        elif self.state == "hurt":
-            if self.state_t >= 0.25:
-                self.set_state("walk" if moved > 1e-4 else "idle")
-        else:
-            self.set_state("walk" if moved > 1e-4 else "idle")
+    base = pygame.Rect(72, 72, 112, 140)
+    paper = (250, 250, 250, 255)
+    edge = (210, 210, 210, 255)
 
-# ---------- OpenGL shaders, utils, drawing (UENDRET) ----------
-VS_SRC = """
-#version 330 core
-layout (location = 0) in vec2 in_pos;
-layout (location = 1) in vec2 in_uv;
-layout (location = 2) in vec3 in_col;
-layout (location = 3) in float in_depth;
+    # 3-4 offset sheets
+    for i, off in enumerate([(10, -10), (6, -6), (3, -3), (0, 0)]):
+        r = base.move(off)
+        a = 255 - i*18
+        pygame.draw.rect(s, (paper[0], paper[1], paper[2], a), r, border_radius=6)
+        pygame.draw.rect(s, (edge[0], edge[1], edge[2], a), r, width=2, border_radius=6)
 
-out vec2 v_uv;
-out vec3 v_col;
-out float v_depth;
+    # top "CV" text
+    try:
+        font = pygame.font.SysFont("Arial", 40, bold=True)
+    except Exception:
+        font = pygame.font.Font(None, 40)
+    txt = font.render("CV", True, (40, 40, 40))
+    s.blit(txt, (base.x + 40, base.y + 14))
 
-void main() {
-    v_uv = in_uv;
-    v_col = in_col;
-    v_depth = in_depth;
-    gl_Position = vec4(in_pos, 0.0, 1.0);
-}
-"""
+    return s
 
-FS_SRC = """
-#version 330 core
-in vec2 v_uv;
-in vec3 v_col;
-in float v_depth;
 
-out vec4 fragColor;
-
-uniform sampler2D uTexture;
-uniform bool uUseTexture;
-
-void main() {
-    vec4 base = vec4(1.0);
-    if (uUseTexture) {
-        base = texture(uTexture, v_uv);
-        if (base.a < 0.01) discard;
-    }
-    vec3 rgb = base.rgb * v_col;
-    fragColor = vec4(rgb, base.a);
-    gl_FragDepth = clamp(v_depth, 0.0, 1.0);
-}
-"""
-
-def compile_shader(src: str, stage: int) -> int:
-    sid = gl.glCreateShader(stage)
-    gl.glShaderSource(sid, src)
-    gl.glCompileShader(sid)
-    status = gl.glGetShaderiv(sid, gl.GL_COMPILE_STATUS)
-    if status != gl.GL_TRUE:
-        log = gl.glGetShaderInfoLog(sid).decode()
-        raise RuntimeError(f"Shader compile error:\n{log}")
-    return sid
-
-def make_program(vs_src: str, fs_src: str) -> int:
-    vs = compile_shader(vs_src, gl.GL_VERTEX_SHADER)
-    fs = compile_shader(fs_src, gl.GL_FRAGMENT_SHADER)
-    prog = gl.glCreateProgram()
-    gl.glAttachShader(prog, vs)
-    gl.glAttachShader(prog, fs)
-    gl.glLinkProgram(prog)
-    ok = gl.glGetProgramiv(prog, gl.GL_LINK_STATUS)
-    gl.glDeleteShader(vs)
-    gl.glDeleteShader(fs)
-    if ok != gl.GL_TRUE:
-        log = gl.glGetProgramInfoLog(prog).decode()
-        raise RuntimeError(f"Program link error:\n{log}")
-    return prog
-
-def surface_to_texture(
-    surf: pygame.Surface,
-    min_filter=gl.GL_LINEAR, mag_filter=gl.GL_LINEAR,
-    wrap_s=gl.GL_REPEAT, wrap_t=gl.GL_REPEAT
-) -> int:
-    data = pygame.image.tostring(surf.convert_alpha(), "RGBA", True)
-    w, h = surf.get_width(), surf.get_height()
-    tid = gl.glGenTextures(1)
-    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
-    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, min_filter)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, mag_filter)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, wrap_s)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, wrap_t)
-    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-    return tid
-
-def make_white_texture() -> int:
-    surf = pygame.Surface((1, 1), pygame.SRCALPHA)
-    surf.fill((255, 255, 255, 255))
-    return surface_to_texture(surf)
-
+# ---------- Prosedural tekstur (pygame.Surface) ----------
 def make_brick_texture() -> pygame.Surface:
     surf = pygame.Surface((TEX_W, TEX_H))
     surf.fill((150, 40, 40))
@@ -423,124 +249,458 @@ def make_metal_texture() -> pygame.Surface:
     return surf
 
 def make_bullet_texture() -> pygame.Surface:
-    size = 32
-    cx = cy = size // 2
-    surf = pygame.Surface((size, size), pygame.SRCALPHA)
-    max_r = 7
-    core_r = 3
-    for y in range(size):
-        for x in range(size):
-            dx = x - cx
-            dy = y - cy
-            d = math.hypot(dx, dy)
-            if d <= max_r:
-                t = 1.0 - (d / max_r)
-                r, g, b = 255, 240, 180
-                a = int(255 * (t ** 1.5) * 0.85)
-                surf.set_at((x, y), (r, g, b, a))
-    pygame.draw.circle(surf, (255, 255, 255, 230), (cx - 2, cy - 2), core_r)
-    return surf
+    """White 'CV' paper sprite with alpha (square texture)."""
+    W, H = 128, 128  # bump to 128 for crisper text
+    s = pygame.Surface((W, H), pygame.SRCALPHA)
+    s.fill((0, 0, 0, 0))
 
+    # soft drop shadow behind paper
+    shadow = pygame.Surface((W, H), pygame.SRCALPHA)
+    pygame.draw.ellipse(shadow, (0, 0, 0, 80), (20, 78, 88, 36))
+    s.blit(shadow, (0, 0))
+
+    # paper sheet
+    paper_rect = pygame.Rect(24, 16, 80, 100)
+    paper_col = (250, 250, 250, 255)
+    edge_col = (210, 210, 210, 255)
+    pygame.draw.rect(s, paper_col, paper_rect, border_radius=6)
+    pygame.draw.rect(s, edge_col, paper_rect, width=2, border_radius=6)
+
+    # folded corner
+    fold = [ (paper_rect.right-18, paper_rect.top+2),
+             (paper_rect.right-2,   paper_rect.top+18),
+             (paper_rect.right-2,   paper_rect.top+2) ]
+    pygame.draw.polygon(s, (235, 235, 235, 255), fold)
+
+    # 'CV' title
+    try:
+        font = pygame.font.SysFont("Arial", 36, bold=True)
+    except Exception:
+        font = pygame.font.Font(None, 36)
+    text = font.render("CV", True, (40, 40, 40))
+    s.blit(text, (paper_rect.x + 24, paper_rect.y + 10))
+
+    # a few lines to suggest content
+    x0 = paper_rect.x + 10
+    x1 = paper_rect.right - 10
+    y = paper_rect.y + 40
+    for i in range(5):
+        pygame.draw.line(s, (140, 140, 140, 220), (x0, y + i*14), (x1, y + i*14), 2)
+
+    return s
+
+# ---------- OpenGL utils ----------
+VS_SRC = """
+#version 330 core
+layout (location = 0) in vec2 in_pos;    // NDC -1..1
+layout (location = 1) in vec2 in_uv;
+layout (location = 2) in vec3 in_col;    // per-vertex farge (for dimming/overlay)
+layout (location = 3) in float in_depth; // 0..1 depth (0 nær, 1 fjern)
+
+out vec2 v_uv;
+out vec3 v_col;
+out float v_depth;
+
+void main() {
+    v_uv = in_uv;
+    v_col = in_col;
+    v_depth = in_depth;
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+}
+"""
+
+FS_SRC = """
+#version 330 core
+in vec2 v_uv;
+in vec3 v_col;
+in float v_depth;
+
+out vec4 fragColor;
+
+uniform sampler2D uTexture;
+uniform bool uUseTexture;
+
+void main() {
+    vec4 base = vec4(1.0);
+    if (uUseTexture) {
+        base = texture(uTexture, v_uv);
+        if (base.a < 0.01) discard; // alpha for sprites
+    }
+    vec3 rgb = base.rgb * v_col;
+    fragColor = vec4(rgb, base.a);
+    // Skriv eksplisitt dybde (lineær i [0..1])
+    gl_FragDepth = clamp(v_depth, 0.0, 1.0);
+}
+"""
+
+def compile_shader(src: str, stage: int) -> int:
+    sid = gl.glCreateShader(stage)
+    gl.glShaderSource(sid, src)
+    gl.glCompileShader(sid)
+    status = gl.glGetShaderiv(sid, gl.GL_COMPILE_STATUS)
+    if status != gl.GL_TRUE:
+        log = gl.glGetShaderInfoLog(sid).decode()
+        raise RuntimeError(f"Shader compile error:\n{log}")
+    return sid
+
+def make_program(vs_src: str, fs_src: str) -> int:
+    vs = compile_shader(vs_src, gl.GL_VERTEX_SHADER)
+    fs = compile_shader(fs_src, gl.GL_FRAGMENT_SHADER)
+    prog = gl.glCreateProgram()
+    gl.glAttachShader(prog, vs)
+    gl.glAttachShader(prog, fs)
+    gl.glLinkProgram(prog)
+    ok = gl.glGetProgramiv(prog, gl.GL_LINK_STATUS)
+    gl.glDeleteShader(vs)
+    gl.glDeleteShader(fs)
+    if ok != gl.GL_TRUE:
+        log = gl.glGetProgramInfoLog(prog).decode()
+        raise RuntimeError(f"Program link error:\n{log}")
+    return prog
+
+def surface_to_texture(surf: pygame.Surface) -> int:
+    """Upload a pygame.Surface (with per-pixel alpha) to GL_TEXTURE_2D."""
+    # Ensure we have 32-bit RGBA pixels in the Surface *without* display-dependent conversion
+    # Avoid convert_alpha() quirks; grab raw pixels in a known order.
+    data = pygame.image.tostring(surf, "RGBA", False)  # no flip
+
+    w, h = surf.get_width(), surf.get_height()
+    tid = gl.glGenTextures(1)
+
+    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+
+    # Be explicit about row alignment (safest for all widths)
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+
+    # Use GL_RGBA as both internal and external format for maximum compatibility
+    gl.glTexImage2D(
+        gl.GL_TEXTURE_2D, 0, gl.GL_RGBA,
+        w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data
+    )
+
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+
+    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+    return tid
+
+def make_white_texture() -> int:
+    surf = pygame.Surface((1, 1), pygame.SRCALPHA)
+    surf.fill((255, 255, 255, 255))
+    return surface_to_texture(surf)
+
+def make_enemy_texture() -> pygame.Surface:
+    s = pygame.Surface((256, 256), pygame.SRCALPHA)
+    # kropp
+    pygame.draw.rect(s, (60, 60, 70, 255), (100, 80, 56, 120), border_radius=6)
+    # hode
+    pygame.draw.circle(s, (220, 200, 180, 255), (128, 70), 26)
+    # hjelm-ish
+    pygame.draw.arc(s, (40, 40, 50, 255), (92, 40, 72, 40), 3.14, 0, 6)
+    # “arm”
+    pygame.draw.rect(s, (60, 60, 70, 255), (86, 110, 24, 16))
+    pygame.draw.rect(s, (60, 60, 70, 255), (146, 110, 24, 16))
+    return s
+
+def make_weapon_empty_hands_surface() -> pygame.Surface:
+    """Hands only, no CV stack."""
+    W, H = 512, 512
+    s = pygame.Surface((W, H), pygame.SRCALPHA)
+
+    # background transparent
+    s.fill((0, 0, 0, 0))
+
+    skin = (229, 197, 165, 255)
+    shadow = (205, 175, 145, 200)
+    sleeve = (40, 60, 120, 255)
+
+    # Left hand
+    left_hand = pygame.Rect(120, 360, 120, 90)
+    pygame.draw.rect(s, skin, left_hand, border_radius=20)
+    pygame.draw.rect(s, shadow, left_hand.inflate(-18, -18), width=0, border_radius=16)
+    pygame.draw.ellipse(s, skin, (90, 360, 60, 60))  # thumb
+    pygame.draw.rect(s, sleeve, (100, 410, 100, 80), border_radius=16)
+
+    # Right hand
+    right_hand = pygame.Rect(272, 360, 120, 90)
+    pygame.draw.rect(s, skin, right_hand, border_radius=20)
+    pygame.draw.rect(s, shadow, right_hand.inflate(-18, -18), width=0, border_radius=16)
+    pygame.draw.ellipse(s, skin, (382, 360, 60, 60))  # thumb
+    pygame.draw.rect(s, sleeve, (312, 410, 100, 80), border_radius=16)
+
+    return s
+
+
+def make_weapon_hands_cv_surface() -> pygame.Surface:
+    """Procedurally draw two hands holding a stack of 'CV' papers (RGBA)."""
+    W, H = 512, 512
+    s = pygame.Surface((W, H), pygame.SRCALPHA)
+
+    # Background transparent
+    s.fill((0, 0, 0, 0))
+
+    # --- Paper stack ---
+    # Base paper rectangle
+    base_rect = pygame.Rect(156, 210, 200, 260)
+    paper_col = (245, 245, 245, 255)
+    edge_col = (210, 210, 210, 255)
+    pygame.draw.rect(s, paper_col, base_rect, border_radius=8)
+    pygame.draw.rect(s, edge_col, base_rect, width=2, border_radius=8)
+
+    # Slightly offset layers to look like a stack
+    for i, offset in enumerate([(6, -8), (10, -16), (14, -24)]):
+        r = base_rect.move(offset[0], offset[1])
+        a = max(160, 255 - 30 * i)
+        pygame.draw.rect(s, (paper_col[0], paper_col[1], paper_col[2], a), r, border_radius=8)
+        pygame.draw.rect(s, (edge_col[0], edge_col[1], edge_col[2], a), r, width=2, border_radius=8)
+
+    # "CV" title on the top sheet
+    try:
+        font = pygame.font.SysFont("Arial", 72, bold=True)
+    except Exception:
+        font = pygame.font.Font(None, 72)
+    cv_text = font.render("CV", True, (30, 30, 30))
+    s.blit(cv_text, (base_rect.x + 70, base_rect.y + 30))
+
+    # A few horizontal lines to mimic text
+    line_x = base_rect.x + 24
+    for i in range(6):
+        y = base_rect.y + 110 + i * 30
+        pygame.draw.line(s, (120, 120, 120, 200), (line_x, y), (base_rect.right - 24, y), 3)
+
+    # --- Hands ---
+    skin = (229, 197, 165, 255)
+    shadow = (205, 175, 145, 200)
+    sleeve = (40, 60, 120, 255)
+
+    # Left hand (simple rounded rect + thumb)
+    left_hand = pygame.Rect(120, 360, 120, 90)
+    pygame.draw.rect(s, skin, left_hand, border_radius=20)
+    pygame.draw.rect(s, shadow, left_hand.inflate(-18, -18), width=0, border_radius=16)
+    # Left thumb
+    pygame.draw.ellipse(s, skin, (90, 360, 60, 60))
+    # Left sleeve
+    pygame.draw.rect(s, sleeve, (100, 410, 100, 80), border_radius=16)
+
+    # Right hand
+    right_hand = pygame.Rect(272, 360, 120, 90)
+    pygame.draw.rect(s, skin, right_hand, border_radius=20)
+    pygame.draw.rect(s, shadow, right_hand.inflate(-18, -18), width=0, border_radius=16)
+    # Right thumb
+    pygame.draw.ellipse(s, skin, (382, 360, 60, 60))
+    # Right sleeve
+    pygame.draw.rect(s, sleeve, (312, 410, 100, 80), border_radius=16)
+
+    # Small drop shadow under papers (for depth)
+    shadow_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+    pygame.draw.ellipse(shadow_surf, (0, 0, 0, 80), (160, 440, 192, 40))
+    s.blit(shadow_surf, (0, 0))
+
+    return s
+
+
+# ---------- GL Renderer state ----------
+from pathlib import Path
+import os
+import pygame
+from OpenGL import GL as gl
+
+# ---------- GL Renderer state ----------
 class GLRenderer:
     def __init__(self) -> None:
+        # Shader program
         self.prog = make_program(VS_SRC, FS_SRC)
         gl.glUseProgram(self.prog)
         self.uni_tex = gl.glGetUniformLocation(self.prog, "uTexture")
         self.uni_use_tex = gl.glGetUniformLocation(self.prog, "uUseTexture")
         gl.glUniform1i(self.uni_tex, 0)
 
+        # VAO/VBO (dynamisk buffer per draw)
         self.vao = gl.glGenVertexArrays(1)
         self.vbo = gl.glGenBuffers(1)
         gl.glBindVertexArray(self.vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
-        stride = 8 * 4
+
+        stride = 8 * 4  # 8 float32 per vertex
+        # in_pos (loc 0): 2 floats
         gl.glEnableVertexAttribArray(0)
         gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.ctypes.c_void_p(0))
+        # in_uv (loc 1): 2 floats
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.ctypes.c_void_p(2 * 4))
+        # in_col (loc 2): 3 floats
         gl.glEnableVertexAttribArray(2)
         gl.glVertexAttribPointer(2, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.ctypes.c_void_p(4 * 4))
+        # in_depth (loc 3): 1 float
         gl.glEnableVertexAttribArray(3)
         gl.glVertexAttribPointer(3, 1, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.ctypes.c_void_p(7 * 4))
+
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
         gl.glBindVertexArray(0)
 
+        # Teksturer
         self.white_tex = make_white_texture()
-        self.textures: dict[int, int] = {}
-        self.enemy_sheets: dict[str, SpriteSheet] = {}
+        self.textures: dict[int, int] = {}  # tex_id -> GL texture
 
-        self.load_textures_and_sprites()
+        # Weapon sprite (procedural)
+        self.weapon_tex = surface_to_texture(make_weapon_hands_cv_surface())
+        self.weapon_w = 512
+        self.weapon_h = 512
 
+        self.weapon_empty_tex = surface_to_texture(make_weapon_empty_hands_surface())
+
+
+        # Ammo pickup sprite
+        self.textures[150] = surface_to_texture(make_cv_stack_surface())
+
+
+        # Last fra assets hvis tilgjengelig, ellers fall tilbake til proseduralt
+        self.load_textures()
+
+        # GL state
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthFunc(gl.GL_LEQUAL)
 
-    def _resolve_dir(self, leaf: str) -> Path:
+    # ---------- teksturhjelpere ----------
+    @staticmethod
+    def _scale_if_needed(surf: pygame.Surface, size: int = 512) -> pygame.Surface:
+        if surf.get_width() != size or surf.get_height() != size:
+            surf = pygame.transform.smoothscale(surf, (size, size))
+        return surf
+
+    def _load_texture_file(self, path: str, size: int = 512) -> int:
+        surf = pygame.image.load(path).convert_alpha()
+        surf = self._scale_if_needed(surf, size)
+        return surface_to_texture(surf)
+
+    # ---------- offentlig laster ----------
+
+    def _resolve_textures_base(self) -> Path:
+        """
+        Finn korrekt assets/textures-katalog robust, uavhengig av hvor vi kjører fra.
+        Prøver i rekkefølge:
+          - <her>/assets/textures
+          - <her>/../assets/textures
+          - <her>/../../assets/textures      <-- typisk når koden ligger i src/wolfie3d
+          - <cwd>/assets/textures
+        """
         here = Path(__file__).resolve().parent
         candidates = [
-            here / "assets" / leaf,
-            here.parent / "assets" / leaf,
-            here.parent.parent / "assets" / leaf,
-            Path.cwd() / "assets" / leaf,
+            here / "assets" / "textures",
+            here.parent / "assets" / "textures",
+            here.parent.parent / "assets" / "textures",
+            Path.cwd() / "assets" / "textures",
         ]
+        print("\n[GLRenderer] Prøver å finne assets/textures på disse stedene:")
         for c in candidates:
+            print("  -", c)
             if c.exists():
+                print("[GLRenderer] FANT:", c)
                 return c
-        raise FileNotFoundError(f"Fant ikke assets/{leaf} i: {candidates}")
 
-    def load_textures_and_sprites(self) -> None:
-        textures_dir = self._resolve_dir("textures")
-        sprites_dir  = self._resolve_dir("sprites")
-
-        def _load_square(path: Path, size: int = 512) -> int:
-            surf = pygame.image.load(str(path)).convert_alpha()
-            if surf.get_width() != size or surf.get_height() != size:
-                surf = pygame.transform.smoothscale(surf, (size, size))
-            return surface_to_texture(surf)
-
-        need = {
-            1: textures_dir / "bricks.png",
-            2: textures_dir / "stone.png",
-            3: textures_dir / "wood.png",
-            4: textures_dir / "metal.png",
-        }
-        for tid, p in need.items():
-            if not p.exists(): raise FileNotFoundError(f"Mangler {p}")
-            self.textures[tid] = _load_square(p, 512)
-
-        # Kule
-        self.textures[99] = surface_to_texture(
-            make_bullet_texture(),
-            gl.GL_LINEAR, gl.GL_LINEAR,
-            gl.GL_CLAMP_TO_EDGE, gl.GL_CLAMP_TO_EDGE
+        raise FileNotFoundError(
+            "Fant ikke assets/textures i noen av kandidatkatalogene over. "
+            "Opprett assets/textures på prosjektnivå (samme nivå som src) eller justér stien."
         )
 
-        # Enemy sheets
-        def _load_sheet(path: Path, fps: float, loop: bool) -> SpriteSheet:
+    def load_textures(self) -> None:
+        """
+        Debug-variant som bruker korrekt prosjekt-rot og feiler høyt hvis filer mangler.
+        Forventer: bricks.png, stone.png, wood.png, metal.png i assets/textures/.
+        """
+        base = self._resolve_textures_base()
+        print(f"[GLRenderer] pygame extended image support: {pygame.image.get_extended()}")
+        print(f"[GLRenderer] Innhold i {base}: {[p.name for p in base.glob('*')]}")
+
+        files = {
+            1: base / "bricks.png",
+            2: base / "stone.png",
+            3: base / "wood.png",
+            4: base / "metal.png",
+        }
+        missing = [p for p in files.values() if not p.exists()]
+        if missing:
+            print("[GLRenderer] MANGEL: følgende filer finnes ikke:")
+            for m in missing:
+                print("  -", m)
+            raise FileNotFoundError(
+                "Manglende teksturer. Sørg for at filene ligger i assets/textures/")
+
+        def _load(path: Path, size: int = 512) -> int:
+            print(f"[GLRenderer] Laster: {path}")
             surf = pygame.image.load(str(path)).convert_alpha()
-            w, h = surf.get_width(), surf.get_height()
-            frames = max(1, w // SPRITE_FRAME)
-            tex = surface_to_texture(surf, gl.GL_NEAREST, gl.GL_NEAREST, gl.GL_CLAMP_TO_EDGE, gl.GL_CLAMP_TO_EDGE)
-            return SpriteSheet(tex, w, h, w // frames, h, frames, fps, loop)
+            if surf.get_width() != size or surf.get_height() != size:
+                print(
+                    f"[GLRenderer]  - rescale {surf.get_width()}x{surf.get_height()} -> {size}x{size}")
+                surf = pygame.transform.smoothscale(surf, (size, size))
+            tex_id = surface_to_texture(surf)
+            print(f"[GLRenderer]  - OK (GL tex id {tex_id})")
+            return tex_id
 
-        sheet_specs = [
-            ("idle",      "Idle.png",      6.0,  True),
-            ("walk",      "Walk.png",      10.0, True),
-            ("run",       "Run.png",       12.0, True),
-            ("attack",    "Attack.png",    10.0, True),
-            ("shot_1",    "Shot_1.png",    12.0, True),
-            ("shot_2",    "Shot_2.png",    12.0, True),
-            ("hurt",      "Hurt.png",      8.0,  True),
-            ("dead",      "Dead.png",      10.0, False),
-            ("grenade",   "Grenade.png",   12.0, True),
-            ("explosion", "Explosion.png", 14.0, False),
-        ]
-        for key, fname, fps, loop in sheet_specs:
-            p = sprites_dir / fname
-            if p.exists():
-                self.enemy_sheets[key] = _load_sheet(p, fps, loop)
+        self.textures[1] = _load(files[1], 512)
+        self.textures[2] = _load(files[2], 512)
+        self.textures[3] = _load(files[3], 512)
+        self.textures[4] = _load(files[4], 512)
 
+        # Sprite (kule) – behold prosedyre
+        self.textures[99] = surface_to_texture(make_bullet_texture())
+
+        # Enemy sprite (ID 200): prøv fil, ellers prosedyral placeholder
+        try:
+            sprites_dir = self._resolve_textures_base().parent / "sprites"
+            enemy_path = sprites_dir / "sjefen.png"
+            print(f"[GLRenderer] Leter etter enemy sprite i: {enemy_path}")
+            if enemy_path.exists():
+                self.textures[200] = self._load_texture_file(enemy_path, 512)
+                print(f"[GLRenderer] Enemy OK (GL tex id {self.textures[200]})")
+            else:
+                # fallback – prosedural fiende
+                self.textures[200] = surface_to_texture(make_enemy_texture())
+                print("[GLRenderer] Enemy: bruker prosedural sprite")
+        except Exception as ex:
+            print(f"[GLRenderer] Enemy: FEIL ved lasting ({ex}), bruker prosedural")
+            self.textures[200] = surface_to_texture(make_enemy_texture())
+
+        # Enemy HAPPY sprite (ID 201): assets/sprites/sjefenglad.png
+        try:
+            sprites_dir = self._resolve_textures_base().parent / "sprites"
+            happy_path = sprites_dir / "sjefenglad.png"
+            print(f"[GLRenderer] Leter etter happy sprite i: {happy_path}")
+            if happy_path.exists():
+                self.textures[201] = self._load_texture_file(happy_path, 512)
+                print(f"[GLRenderer] Happy enemy OK (GL tex id {self.textures[201]})")
+            else:
+                # fallback: reuse normal enemy if not present
+                self.textures[201] = self.textures.get(200, surface_to_texture(make_enemy_texture()))
+                print("[GLRenderer] Happy enemy: fant ikke fil, bruker fallback")
+        except Exception as ex:
+            print(f"[GLRenderer] Happy enemy: FEIL ved lasting ({ex}), bruker fallback")
+            self.textures[201] = self.textures.get(200, surface_to_texture(make_enemy_texture()))
+
+
+        # Kill screen (full-screen image)
+        try:
+            sprites_dir = self._resolve_textures_base().parent / "sprites"
+            end_path = sprites_dir / "end.png"
+            print(f"[GLRenderer] Leter etter end screen i: {end_path}")
+            if end_path.exists():
+                self.textures[999] = self._load_texture_file(end_path, size=1024)
+                print(f"[GLRenderer] End screen OK (GL tex id {self.textures[999]})")
+            else:
+                print("[GLRenderer] End screen not found; fallback to white")
+                self.textures[999] = self.white_tex
+        except Exception as ex:
+            print(f"[GLRenderer] End screen: FEIL ved lasting ({ex})")
+            self.textures[999] = self.white_tex
+
+
+        print("[GLRenderer] Teksturer lastet.\n")
+
+    # ---------- draw ----------
     def draw_arrays(self, verts: np.ndarray, texture: int, use_tex: bool) -> None:
         if verts.size == 0:
             return
@@ -548,27 +708,87 @@ class GLRenderer:
         gl.glUniform1i(self.uni_use_tex, 1 if use_tex else 0)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, texture if use_tex else self.white_tex)
+
         gl.glBindVertexArray(self.vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, verts.nbytes, verts, gl.GL_DYNAMIC_DRAW)
-        gl.glDrawArrays(gl.GL_TRIANGLES, 0, verts.shape[0])
+        count = verts.shape[0]
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, count)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
         gl.glBindVertexArray(0)
 
+# ---------- Raycasting + bygg GL-verts ----------
 def column_ndc(x: int) -> tuple[float, float]:
+    """Returnerer venstre/høyre NDC-X for en 1-px bred skjermkolonne."""
     x_left = (2.0 * x) / WIDTH - 1.0
     x_right = (2.0 * (x + 1)) / WIDTH - 1.0
     return x_left, x_right
 
 def y_ndc(y_pix: int) -> float:
+    """Konverter skjerm-Y (0 top) til NDC-Y (1 top, -1 bunn)."""
     return 1.0 - 2.0 * (y_pix / float(HEIGHT))
 
 def dim_for_side(side: int) -> float:
+    # dim litt på sidevegger (liknende BLEND_MULT tidligere)
     return 0.78 if side == 1 else 1.0
+
+def build_pickups_batch(pickups: list['Pickup']) -> np.ndarray:
+    """Billboard quads for floor pickups (stacks of CVs)."""
+    verts: list[float] = []
+    for p in pickups:
+        if not p.alive:
+            continue
+        spr_x = p.x - player_x
+        spr_y = p.y - player_y
+        inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y + 1e-9)
+        trans_x = inv_det * (dir_y * spr_x - dir_x * spr_y)
+        trans_y = inv_det * (-plane_y * spr_x + plane_x * spr_y)
+        if trans_y <= 0:
+            continue
+
+        sprite_screen_x = int((WIDTH / 2) * (1 + trans_x / trans_y))
+
+        sprite_h = abs(int(HEIGHT / trans_y))
+        sprite_w = sprite_h  # square sprite texture
+        v_shift = int((0.5 - p.height_param) * sprite_h)  # place near floor
+
+        draw_start_y = max(0, -sprite_h // 2 + HALF_H + v_shift)
+        draw_end_y   = min(HEIGHT - 1, draw_start_y + sprite_h)
+        draw_start_x = -sprite_w // 2 + sprite_screen_x
+        draw_end_x   = draw_start_x + sprite_w
+        if draw_end_x < 0 or draw_start_x >= WIDTH:
+            continue
+
+        draw_start_x = max(0, draw_start_x)
+        draw_end_x   = min(WIDTH - 1, draw_end_x)
+
+        x0 = (2.0 * draw_start_x) / WIDTH - 1.0
+        x1 = (2.0 * (draw_end_x + 1)) / WIDTH - 1.0
+        y0 = 1.0 - 2.0 * (draw_start_y / HEIGHT)
+        y1 = 1.0 - 2.0 * (draw_end_y   / HEIGHT)
+
+        depth = clamp01(trans_y / FAR_PLANE)
+        r = g = b = 1.0
+        u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+
+        verts.extend([
+            x0, y0, u0, v0, r, g, b, depth,
+            x0, y1, u0, v1, r, g, b, depth,
+            x1, y0, u1, v0, r, g, b, depth,
+
+            x1, y0, u1, v0, r, g, b, depth,
+            x0, y1, u0, v1, r, g, b, depth,
+            x1, y1, u1, v1, r, g, b, depth,
+        ])
+    if not verts:
+        return np.zeros((0, 8), dtype=np.float32)
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
 
 def cast_and_build_wall_batches() -> dict[int, list[float]]:
     batches: dict[int, list[float]] = {1: [], 2: [], 3: [], 4: []}
     for x in range(WIDTH):
+        # Raydir
         camera_x = 2.0 * x / WIDTH - 1.0
         ray_dir_x = dir_x + plane_x * camera_x
         ray_dir_y = dir_y + plane_y * camera_x
@@ -619,26 +839,36 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
             wall_x = player_x + perp_wall_dist * ray_dir_x
 
         wall_x -= math.floor(wall_x)
+        # u-koordinat (kontinuerlig) + flip for samsvar med klassisk raycaster
         u = wall_x
         if (side == 0 and ray_dir_x > 0) or (side == 1 and ray_dir_y < 0):
             u = 1.0 - u
 
+        # skjermhøyde på vegg
         line_height = int(HEIGHT / (perp_wall_dist + 1e-6))
         draw_start = max(0, -line_height // 2 + HALF_H)
         draw_end = min(HEIGHT - 1, line_height // 2 + HALF_H)
 
+        # NDC koordinater for 1-px bred stripe
         x_left, x_right = column_ndc(x)
         top_ndc = y_ndc(draw_start)
         bot_ndc = y_ndc(draw_end)
 
+        # Farge-dim (samme på hele kolonnen)
         c = dim_for_side(side)
         r = g = b = c
+
+        # Depth som lineær [0..1] (0 = nærmest)
         depth = clamp01(perp_wall_dist / FAR_PLANE)
 
+        # 2 triangler (6 vertikser). Vertex-layout:
+        # [x, y, u, v, r, g, b, depth]
         v = [
+            # tri 1
             x_left,  top_ndc, u, 0.0, r, g, b, depth,
             x_left,  bot_ndc, u, 1.0, r, g, b, depth,
             x_right, top_ndc, u, 0.0, r, g, b, depth,
+            # tri 2
             x_right, top_ndc, u, 0.0, r, g, b, depth,
             x_left,  bot_ndc, u, 1.0, r, g, b, depth,
             x_right, bot_ndc, u, 1.0, r, g, b, depth,
@@ -646,76 +876,177 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
         batches.setdefault(tex_id, []).extend(v)
     return batches
 
+def build_fullscreen_quad() -> np.ndarray:
+    """Fullscreen quad with UVs (0..1)."""
+    verts = [
+        -1.0,  1.0, 0.0, 0.0, 1,1,1,0,
+        -1.0, -1.0, 0.0, 1.0, 1,1,1,0,
+         1.0,  1.0, 1.0, 0.0, 1,1,1,0,
+
+         1.0,  1.0, 1.0, 0.0, 1,1,1,0,
+        -1.0, -1.0, 0.0, 1.0, 1,1,1,0,
+         1.0, -1.0, 1.0, 1.0, 1,1,1,0,
+    ]
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
+
 def build_fullscreen_background() -> np.ndarray:
+    """To store quads (himmel/gulv), farget med vertex-color, tegnes uten tekstur."""
+    # Himmel (øverst halvdel)
     sky_col = (40/255.0, 60/255.0, 90/255.0)
     floor_col = (35/255.0, 35/255.0, 35/255.0)
     verts: list[float] = []
+
+    # Quad helper
     def add_quad(x0, y0, x1, y1, col):
         r, g, b = col
-        depth = 1.0
+        depth = 1.0  # lengst bak
+        # u,v er 0 (vi bruker hvit 1x1 tekstur)
         verts.extend([
             x0, y0, 0.0, 0.0, r, g, b, depth,
             x0, y1, 0.0, 1.0, r, g, b, depth,
             x1, y0, 1.0, 0.0, r, g, b, depth,
+
             x1, y0, 1.0, 0.0, r, g, b, depth,
             x0, y1, 0.0, 1.0, r, g, b, depth,
             x1, y1, 1.0, 1.0, r, g, b, depth,
         ])
-    add_quad(-1.0,  1.0,  1.0,  0.0, sky_col)
-    add_quad(-1.0,  0.0,  1.0, -1.0, floor_col)
+
+    # Koordinater i NDC
+    add_quad(-1.0,  1.0,  1.0,  0.0, sky_col)   # øvre halvdel
+    add_quad(-1.0,  0.0,  1.0, -1.0, floor_col) # nedre halvdel
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
 def build_sprites_batch(bullets: list[Bullet]) -> np.ndarray:
+    """Bygger ett quad per kule i skjermen (billboard), med depth."""
     verts: list[float] = []
-    BULLET_SCALE = 0.45
+
     for b in bullets:
+        # Transform til kamera-rom
         spr_x = b.x - player_x
         spr_y = b.y - player_y
         inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y + 1e-9)
         trans_x = inv_det * (dir_y * spr_x - dir_x * spr_y)
         trans_y = inv_det * (-plane_y * spr_x + plane_x * spr_y)
         if trans_y <= 0:
-            continue
+            continue  # bak kamera
+
         sprite_screen_x = int((WIDTH / 2) * (1 + trans_x / trans_y))
-        sprite_h = int(abs(int(HEIGHT / trans_y)) * BULLET_SCALE)
-        sprite_w = sprite_h
+
+        sprite_h = abs(int(HEIGHT / trans_y))
+        sprite_w = sprite_h  # kvadratisk
+
+        # vertikal offset: "stiger"
         v_shift = int((0.5 - b.height_param) * sprite_h)
+        draw_start_y = max(0, -sprite_h // 2 + HALF_H + v_shift)
+        draw_end_y   = min(HEIGHT - 1, draw_start_y + sprite_h)
+        # horisontal
+        draw_start_x = -sprite_w // 2 + sprite_screen_x
+        draw_end_x   = draw_start_x + sprite_w
+
+        # Klipp utenfor skjerm
+        if draw_end_x < 0 or draw_start_x >= WIDTH:
+            continue
+        draw_start_x = max(0, draw_start_x)
+        draw_end_x   = min(WIDTH - 1, draw_end_x)
+
+        # Konverter til NDC
+        x0 = (2.0 * draw_start_x) / WIDTH - 1.0
+        x1 = (2.0 * (draw_end_x + 1)) / WIDTH - 1.0
+        y0 = y_ndc(draw_start_y)
+        y1 = y_ndc(draw_end_y)
+
+        # Depth (basert på trans_y)
+        depth = clamp01(trans_y / FAR_PLANE)
+
+        r = g = bcol = 1.0  # ingen ekstra farge-dim
+        # u,v: full tekstur
+        u0, v0 = 0.0, 0.0
+        u1, v1 = 1.0, 1.0
+
+        verts.extend([
+            x0, y0, u0, v0, r, g, bcol, depth,
+            x0, y1, u0, v1, r, g, bcol, depth,
+            x1, y0, u1, v0, r, g, bcol, depth,
+
+            x1, y0, u1, v0, r, g, bcol, depth,
+            x0, y1, u0, v1, r, g, bcol, depth,
+            x1, y1, u1, v1, r, g, bcol, depth,
+        ])
+
+
+
+    if not verts:
+        return np.zeros((0, 8), dtype=np.float32)
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
+def build_enemies_batch_filtered(enemies: list['Enemy'], use_happy: bool) -> np.ndarray:
+    verts: list[float] = []
+    for e in enemies:
+        if not e.alive:
+            continue
+        # choose which set we’re building
+        if use_happy and not e.dying:
+            continue
+        if (not use_happy) and e.dying:
+            continue
+
+        # --- same body as your build_enemies_batch(), unchanged below ---
+        spr_x = e.x - player_x
+        spr_y = e.y - player_y
+        inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y + 1e-9)
+        trans_x = inv_det * (dir_y * spr_x - dir_x * spr_y)
+        trans_y = inv_det * (-plane_y * spr_x + plane_x * spr_y)
+        if trans_y <= 0:
+            continue
+
+        sprite_screen_x = int((WIDTH / 2) * (1 + trans_x / trans_y))
+        sprite_h = abs(int(HEIGHT / trans_y))
+        sprite_w = sprite_h
+        v_shift = int((0.5 - e.height_param) * sprite_h)
+
         draw_start_y = max(0, -sprite_h // 2 + HALF_H + v_shift)
         draw_end_y   = min(HEIGHT - 1, draw_start_y + sprite_h)
         draw_start_x = -sprite_w // 2 + sprite_screen_x
         draw_end_x   = draw_start_x + sprite_w
         if draw_end_x < 0 or draw_start_x >= WIDTH:
             continue
-        draw_start_x = max(0, draw_start_x); draw_end_x = min(WIDTH - 1, draw_end_x)
+
+        draw_start_x = max(0, draw_start_x)
+        draw_end_x   = min(WIDTH - 1, draw_end_x)
+
         x0 = (2.0 * draw_start_x) / WIDTH - 1.0
         x1 = (2.0 * (draw_end_x + 1)) / WIDTH - 1.0
-        y0 = y_ndc(draw_start_y); y1 = y_ndc(draw_end_y)
+        y0 = 1.0 - 2.0 * (draw_start_y / HEIGHT)
+        y1 = 1.0 - 2.0 * (draw_end_y   / HEIGHT)
+
         depth = clamp01(trans_y / FAR_PLANE)
-        r = g = bcol = 1.0
-        u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+        r = g = b = 1.0
+
+        ENEMY_V_FLIP = False  # matches your current no-flip upload path
+        if ENEMY_V_FLIP:
+            u0, v0, u1, v1 = 0.0, 1.0, 1.0, 0.0
+        else:
+            u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+
         verts.extend([
-            x0, y0, u0, v0, r, g, bcol, depth,
-            x0, y1, u0, v1, r, g, bcol, depth,
-            x1, y0, u1, v0, r, g, bcol, depth,
-            x1, y0, u1, v0, r, g, bcol, depth,
-            x0, y1, u0, v1, r, g, bcol, depth,
-            x1, y1, u1, v1, r, g, bcol, depth,
+            x0, y0, u0, v0, r, g, b, depth,
+            x0, y1, u0, v1, r, g, b, depth,
+            x1, y0, u1, v0, r, g, b, depth,
+
+            x1, y0, u1, v0, r, g, b, depth,
+            x0, y1, u0, v1, r, g, b, depth,
+            x1, y1, u1, v1, r, g, b, depth,
         ])
     if not verts:
         return np.zeros((0, 8), dtype=np.float32)
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
-def enemy_frame_index(sh: SpriteSheet, state_t: float) -> int:
-    if sh.frames <= 1:
-        return 0
-    idx = int(state_t * sh.fps)
-    return idx % sh.frames if sh.loop else min(sh.frames - 1, idx)
 
-def build_enemy_batches(enemies: list['Enemy'], sheets: dict[str, SpriteSheet]) -> dict[int, np.ndarray]:
-    STEP_BOB_PIX = 6.0
-    batches: dict[int, list[float]] = {}
+def build_enemies_batch(enemies: list['Enemy']) -> np.ndarray:
+    verts: list[float] = []
     for e in enemies:
-        if e.remove:
+        if not e.alive:
             continue
         spr_x = e.x - player_x
         spr_y = e.y - player_y
@@ -725,79 +1056,155 @@ def build_enemy_batches(enemies: list['Enemy'], sheets: dict[str, SpriteSheet]) 
         if trans_y <= 0:
             continue
 
-        sh = sheets.get(e.state) or sheets.get("walk") or next(iter(sheets.values()))
-        idx = enemy_frame_index(sh, e.state_t)
-        u_step = sh.frame_w / sh.sheet_w
-        u0 = idx * u_step; u1 = u0 + u_step
-        v0, v1 = (1.0, 0.0) if SPRITE_V_FLIP else (0.0, 1.0)
-
         sprite_screen_x = int((WIDTH / 2) * (1 + trans_x / trans_y))
-        sprite_h = int(abs(int(HEIGHT / trans_y)) * ENEMY_BASE_SCALE)
-        sprite_w = sprite_h
+        sprite_h = abs(int(HEIGHT / trans_y))
+        sprite_w = sprite_h  # kvadratisk
         v_shift = int((0.5 - e.height_param) * sprite_h)
-        bob_px = int(math.sin(e.walk_t * 2.0 * math.pi) * STEP_BOB_PIX)
-        draw_start_y = max(0, -sprite_h // 2 + HALF_H + v_shift + bob_px)
+
+        draw_start_y = max(0, -sprite_h // 2 + HALF_H + v_shift)
         draw_end_y   = min(HEIGHT - 1, draw_start_y + sprite_h)
         draw_start_x = -sprite_w // 2 + sprite_screen_x
         draw_end_x   = draw_start_x + sprite_w
         if draw_end_x < 0 or draw_start_x >= WIDTH:
             continue
-        draw_start_x = max(0, draw_start_x); draw_end_x = min(WIDTH - 1, draw_end_x)
+
+        draw_start_x = max(0, draw_start_x)
+        draw_end_x   = min(WIDTH - 1, draw_end_x)
+
         x0 = (2.0 * draw_start_x) / WIDTH - 1.0
         x1 = (2.0 * (draw_end_x + 1)) / WIDTH - 1.0
-        y0 = y_ndc(draw_start_y); y1 = y_ndc(draw_end_y)
+        y0 = 1.0 - 2.0 * (draw_start_y / HEIGHT)
+        y1 = 1.0 - 2.0 * (draw_end_y   / HEIGHT)
+
         depth = clamp01(trans_y / FAR_PLANE)
         r = g = b = 1.0
-        batches.setdefault(sh.tex_id, []).extend([
+
+        ENEMY_V_FLIP = False  # sett False hvis den blir riktig uten flip
+        if ENEMY_V_FLIP:
+            u0, v0, u1, v1 = 0.0, 1.0, 1.0, 0.0
+        else:
+            u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+
+        verts.extend([
             x0, y0, u0, v0, r, g, b, depth,
             x0, y1, u0, v1, r, g, b, depth,
             x1, y0, u1, v0, r, g, b, depth,
+
             x1, y0, u1, v0, r, g, b, depth,
             x0, y1, u0, v1, r, g, b, depth,
             x1, y1, u1, v1, r, g, b, depth,
         ])
-    out: dict[int, np.ndarray] = {}
-    for tex, lst in batches.items():
-        arr = np.asarray(lst, dtype=np.float32).reshape((-1, 8)) if lst else np.zeros((0, 8), dtype=np.float32)
-        out[tex] = arr
-    return out
+
+    if not verts:
+        return np.zeros((0, 8), dtype=np.float32)
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
 
 def build_crosshair_quads(size_px: int = 8, thickness_px: int = 2) -> np.ndarray:
+    """To små rektangler (horisontalt/vertikalt), sentrert i skjermen."""
     verts: list[float] = []
+
     def rect_ndc(cx, cy, w, h):
         x0 = (2.0 * (cx - w)) / WIDTH - 1.0
         x1 = (2.0 * (cx + w)) / WIDTH - 1.0
         y0 = 1.0 - 2.0 * ((cy - h) / HEIGHT)
         y1 = 1.0 - 2.0 * ((cy + h) / HEIGHT)
         return x0, y0, x1, y1
+
     r = g = b = 1.0
-    depth = 0.0
+    depth = 0.0  # helt foran
+
+    # horisontal strek
     x0, y0, x1, y1 = rect_ndc(HALF_W, HALF_H, size_px, thickness_px//2)
-    verts.extend([x0,y0,0,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y0,1,0,r,g,b,depth,
-                  x1,y0,1,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y1,1,1,r,g,b,depth])
+    verts.extend([
+        x0, y0, 0.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y1, 1.0, 1.0, r, g, b, depth,
+    ])
+
+    # vertikal strek
     x0, y0, x1, y1 = rect_ndc(HALF_W, HALF_H, thickness_px//2, size_px)
-    verts.extend([x0,y0,0,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y0,1,0,r,g,b,depth,
-                  x1,y0,1,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y1,1,1,r,g,b,depth])
+    verts.extend([
+        x0, y0, 0.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y1, 1.0, 1.0, r, g, b, depth,
+    ])
+
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
 def build_weapon_overlay(firing: bool, recoil_t: float) -> np.ndarray:
+    """En enkel "pistolboks" nederst (farget quad), m/ liten recoil-bevegelse."""
     base_w, base_h = 200, 120
     x = HALF_W - base_w // 2
     y = HEIGHT - base_h - 10
     if firing:
         y += int(6 * math.sin(min(1.0, recoil_t) * math.pi))
+
     x0 = (2.0 * x) / WIDTH - 1.0
     x1 = (2.0 * (x + base_w)) / WIDTH - 1.0
     y0 = 1.0 - 2.0 * (y / HEIGHT)
     y1 = 1.0 - 2.0 * ((y + base_h) / HEIGHT)
-    r,g,b = (0.12, 0.12, 0.12)
+
+    # lett gjennomsiktig mørk grå
+    # vi bruker v_col for RGB, alpha kommer fra tekstur (1x1 hvit, a=1). For alpha: n.a. her.
+    r, g, b = (0.12, 0.12, 0.12)
     depth = 0.0
-    verts = [x0,y0,0,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y0,1,0,r,g,b,depth,
-             x1,y0,1,0,r,g,b,depth, x0,y1,0,1,r,g,b,depth, x1,y1,1,1,r,g,b,depth]
+    verts = [
+        x0, y0, 0.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+
+        x1, y0, 1.0, 0.0, r, g, b, depth,
+        x0, y1, 0.0, 1.0, r, g, b, depth,
+        x1, y1, 1.0, 1.0, r, g, b, depth,
+    ]
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
-def build_minimap_quads(enemies: list['Enemy']) -> np.ndarray:
-    """Liten GL-basert minimap øverst til venstre – nå med fiender."""
+def build_weapon_sprite_overlay(tex_w: int, tex_h: int, firing: bool, recoil_t: float) -> np.ndarray:
+    """
+    Place a textured quad (the 'weapon') bottom-center, with a tiny vertical recoil.
+    """
+    # Desired on-screen size
+    on_w = 320
+    on_h = int(on_w * (tex_h / tex_w))  # keep aspect
+
+    x = HALF_W - on_w // 2
+    y = HEIGHT - on_h - 12
+
+    if firing:
+        y += int(6 * math.sin(min(1.0, recoil_t) * math.pi))
+
+    x0 = (2.0 * x) / WIDTH - 1.0
+    x1 = (2.0 * (x + on_w)) / WIDTH - 1.0
+    y0 = 1.0 - 2.0 * (y / HEIGHT)
+    y1 = 1.0 - 2.0 * ((y + on_h) / HEIGHT)
+
+    r = g = b = 1.0
+    depth = 0.0
+    u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+
+    verts = [
+        x0, y0, u0, v0, r, g, b, depth,
+        x0, y1, u0, v1, r, g, b, depth,
+        x1, y0, u1, v0, r, g, b, depth,
+
+        x1, y0, u1, v0, r, g, b, depth,
+        x0, y1, u0, v1, r, g, b, depth,
+        x1, y1, u1, v1, r, g, b, depth,
+    ]
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
+
+def build_minimap_quads() -> np.ndarray:
+    """Liten GL-basert minimap øverst til venstre."""
     scale = 6
     mm_w = MAP_W * scale
     mm_h = MAP_H * scale
@@ -814,7 +1221,6 @@ def build_minimap_quads(enemies: list['Enemy']) -> np.ndarray:
             x0, y0, 0.0, 0.0, r, g, b, depth,
             x0, y1, 0.0, 1.0, r, g, b, depth,
             x1, y0, 1.0, 0.0, r, g, b, depth,
-
             x1, y0, 1.0, 0.0, r, g, b, depth,
             x0, y1, 0.0, 1.0, r, g, b, depth,
             x1, y1, 1.0, 1.0, r, g, b, depth,
@@ -823,42 +1229,41 @@ def build_minimap_quads(enemies: list['Enemy']) -> np.ndarray:
     # Bakgrunn
     add_quad_px(pad-2, pad-2, mm_w+4, mm_h+4, (0.1, 0.1, 0.1), 0.0)
 
-    # Veggceller
+    # Celler
     for y in range(MAP_H):
         for x in range(MAP_W):
             if MAP[y][x] > 0:
-                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, (0.86, 0.86, 0.86), 0.0)
+                col = (0.86, 0.86, 0.86)
+                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, col, 0.0)
 
     # Spiller
     px = int(player_x * scale)
     py = int(player_y * scale)
-    add_quad_px(pad + px - 2, pad + py - 2, 4, 4, (0.3, 0.9, 1.0), 0.0)  # lyseblå prikk
+    add_quad_px(pad + px - 2, pad + py - 2, 4, 4, (1.0, 0.3, 0.3), 0.0)
 
-    # Spiller-retning (liten indikator)
+    # Retningsstrek (en liten rektangulær "linje")
     fx = int(px + dir_x * 8)
     fy = int(py + dir_y * 8)
-    add_quad_px(pad + fx - 1, pad + fy - 1, 2, 2, (0.3, 0.9, 1.0), 0.0)
-
-    # Fiender (gule = levende, røde = dør)
-    for e in enemies:
-        if e.remove:
-            continue
-        ex = int(e.x * scale)
-        ey = int(e.y * scale)
-        col = (1.0, 0.85, 0.2) if not e.dying else (1.0, 0.3, 0.3)
-        add_quad_px(pad + ex - 2, pad + ey - 2, 4, 4, col, 0.0)
+    # tegn som tynn boks mellom (px,py) og (fx,fy)
+    # for enkelhet: bare en liten boks på enden
+    add_quad_px(pad + fx - 1, pad + fy - 1, 2, 2, (1.0, 0.3, 0.3), 0.0)
 
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
+# ---------- Input/fysikk ----------
 def try_move(nx: float, ny: float) -> tuple[float, float]:
-    x = nx if not is_wall(int(nx), int(player_y)) else player_x
-    y = ny if not is_wall(int(player_x), int(ny)) else player_y
+    if not is_wall(int(nx), int(player_y)):
+        x = nx
+    else:
+        x = player_x
+    if not is_wall(int(player_x), int(ny)):
+        y = ny
+    else:
+        y = player_y
     return x, y
 
-def handle_input(dt: float, controls_enabled: bool) -> None:
+def handle_input(dt: float) -> None:
     global player_x, player_y, dir_x, dir_y, plane_x, plane_y
-    if not controls_enabled:
-        return
     keys = pygame.key.get_pressed()
     rot = 0.0
     if keys[pygame.K_LEFT] or keys[pygame.K_q]:
@@ -893,46 +1298,158 @@ def handle_input(dt: float, controls_enabled: bool) -> None:
         ny = player_y + (dir_x) * strafe
         player_x, player_y = try_move(nx, ny)
 
+class Pickup:
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+        self.alive = True
+        # render height (where the billboard centers vertically)
+        self.height_param = 0.35
+
+def random_empty_cell(min_dist_from_player: float = 3.0) -> tuple[float, float] | None:
+    """Pick a random empty map cell not too close to the player."""
+    empties = [(x, y) for y in range(MAP_H) for x in range(MAP_W) if MAP[y][x] == 0]
+    random.shuffle(empties)
+    for x, y in empties:
+        cx, cy = x + 0.5, y + 0.5
+        if math.hypot(cx - player_x, cy - player_y) >= min_dist_from_player:
+            return cx, cy
+    return None
+
+def make_text_surface(text: str, font_size: int = 28) -> pygame.Surface:
+    """Render text onto an RGBA surface (tight box)."""
+    try:
+        font = pygame.font.SysFont("DejaVu Sans, Arial", font_size, bold=True)
+    except Exception:
+        font = pygame.font.Font(None, font_size)
+    s = font.render(text, True, (255, 255, 255))
+    # add slight shadow for readability
+    w, h = s.get_width(), s.get_height()
+    out = pygame.Surface((w+2, h+2), pygame.SRCALPHA)
+    shadow = font.render(text, True, (0, 0, 0))
+    out.blit(shadow, (2, 2))
+    out.blit(s, (0, 0))
+    return out
+
+def build_hud_quad_px(x_px: int, y_px: int, w_px: int, h_px: int) -> np.ndarray:
+    """Screen-space textured quad at (x,y) top-left in pixels."""
+    x0 = (2.0 * x_px) / WIDTH - 1.0
+    x1 = (2.0 * (x_px + w_px)) / WIDTH - 1.0
+    y0 = 1.0 - 2.0 * (y_px / HEIGHT)
+    y1 = 1.0 - 2.0 * ((y_px + h_px) / HEIGHT)
+    r = g = b = 1.0
+    depth = 0.0
+    u0, v0, u1, v1 = 0.0, 0.0, 1.0, 1.0
+    verts = [
+        x0, y0, u0, v0, r, g, b, depth,
+        x0, y1, u0, v1, r, g, b, depth,
+        x1, y0, u1, v0, r, g, b, depth,
+        x1, y0, u1, v0, r, g, b, depth,
+        x0, y1, u0, v1, r, g, b, depth,
+        x1, y1, u1, v1, r, g, b, depth,
+    ]
+    return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
+
+def _first_empty_from_corner(corner: str) -> tuple[float, float] | None:
+    """
+    Find the first empty MAP cell scanning inwards from a corner,
+    and return its center (x+0.5, y+0.5).
+    Corners: 'tl','tr','bl','br'
+    """
+    xs = range(1, MAP_W-1)
+    ys = range(1, MAP_H-1)
+    if corner == 'tl':
+        xr, yr = xs, ys
+    elif corner == 'tr':
+        xr, yr = reversed(xs), ys
+    elif corner == 'bl':
+        xr, yr = xs, reversed(ys)
+    elif corner == 'br':
+        xr, yr = reversed(xs), reversed(ys)
+    else:
+        return None
+
+    for y in yr:
+        for x in xr:
+            if MAP[y][x] == 0:
+                return (x + 0.5, y + 0.5)
+    return None
+
+def corner_spawn_positions() -> list[tuple[float, float]]:
+    """Return up to four spawn positions, one per corner (skips if no empty cell found)."""
+    pos = []
+    for c in ('tl', 'tr', 'bl', 'br'):
+        p = _first_empty_from_corner(c)
+        if p:
+            pos.append(p)
+    return pos
+
+def far_from_player(x: float, y: float, min_dist: float = 3.0) -> bool:
+    return math.hypot(x - player_x, y - player_y) >= min_dist
+
+
+
 # ---------- Main ----------
 def main() -> None:
-    global player_x, player_y
     pygame.init()
-    if RANDOM_SEED is not None:
-        random.seed(RANDOM_SEED)
     pygame.display.set_caption("Vibe Wolf (OpenGL)")
 
-    # GL 3.3 core
+    # setup to make it work on mac as well...
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
 
+    # Opprett GL-kontekst
     pygame.display.set_mode((WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF)
     gl.glViewport(0, 0, WIDTH, HEIGHT)
+
     clock = pygame.time.Clock()
     renderer = GLRenderer()
 
-    # Prosjektil-lister
-    player_bullets: list[Bullet] = []
-    enemy_bullets: list[Bullet] = []
+    ammo = 0
+    print(f"[AMMO] {ammo}")
 
+    # --- HUD (ammo text) ---
+    ammo_tex = None
+    ammo_w = ammo_h = 0
+    last_ammo = None
+
+    def refresh_ammo_tex():
+        nonlocal ammo_tex, ammo_w, ammo_h, last_ammo
+        if last_ammo == ammo:
+            return
+        surf = make_text_surface(f"AMMO: {ammo}", 28)
+        ammo_w, ammo_h = surf.get_width(), surf.get_height()
+        # delete old GL texture if any
+        if ammo_tex:
+            gl.glDeleteTextures(int(ammo_tex))
+        ammo_tex = surface_to_texture(surf)
+        last_ammo = ammo
+
+    refresh_ammo_tex()
+
+    pickups: list[Pickup] = []
+    spawn_timer = 0.0
+    SPAWN_INTERVAL = 10.0  # seconds
+    PICKUP_RADIUS = 0.6    # distance to collect
+
+
+    bullets: list[Bullet] = []
     firing = False
     recoil_t = 0.0
 
-    # Spiller-HP og hit-visual
-    player_hp = PLAYER_MAX_HP
-    player_hit_t = 0.0
-    GAME_OVER = False
+    enemies: list[Enemy] = []
+    enemy_spawn_timer = 0.0
+    ENEMY_SPAWN_INTERVAL = 5.0   # spawn more often (tweak as you like)
+    ENEMY_MAX = 12               # cap population
+    ENEMY_MIN_PLAYER_DIST = 3.0  # don't spawn too close
 
-    enemies: list[Enemy] = [
-        Enemy(6.5, 10.5),
-        Enemy(12.5, 12.5),
-        Enemy(16.5, 6.5),
-    ]
+    for (sx, sy) in corner_spawn_positions():
+        if far_from_player(sx, sy, ENEMY_MIN_PLAYER_DIST):
+            enemies.append(Enemy(sx, sy))
 
-    # Spawning-tilstand (TIKKER HVER FRAME – flyttet ut av event-loopen)
-    spawn_interval = SPAWN_INTERVAL_START
-    spawn_timer = 2.0  # liten oppstarts-delay før første spawn
 
+    # Mus-capture (synlig cursor + crosshair)
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(True)
 
@@ -943,157 +1460,189 @@ def main() -> None:
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_TAB:
+                if event.key == pygame.K_TAB:  # eller en annen knapp
                     grab = not pygame.event.get_grab()
                     pygame.event.set_grab(grab)
                     pygame.mouse.set_visible(not grab)
+                    print("Mouse grab:", grab)
                 if event.key == pygame.K_ESCAPE:
                     running = False
-                if not GAME_OVER and event.key == pygame.K_SPACE:
+                if event.key == pygame.K_SPACE:
+                    if ammo > 0:
+                        bx = player_x + dir_x * 0.4
+                        by = player_y + dir_y * 0.4
+                        bvx = dir_x * 10.0
+                        bvy = dir_y * 10.0
+                        bullets.append(Bullet(bx, by, bvx, bvy))
+                        ammo -= 1
+                        print(f"[AMMO] {ammo}")
+                        refresh_ammo_tex()
+                        firing = True
+                        recoil_t = 0.0
+                    else:
+                        print("[AMMO] empty")
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if ammo > 0:
                     bx = player_x + dir_x * 0.4
                     by = player_y + dir_y * 0.4
-                    speed = 10.0
-                    player_bullets.append(Bullet(bx, by, dir_x * speed, dir_y * speed, friendly=True))
+                    bvx = dir_x * 10.0
+                    bvy = dir_y * 10.0
+                    bullets.append(Bullet(bx, by, bvx, bvy))
+                    ammo -= 1
+                    print(f"[AMMO] {ammo}")
                     firing = True
                     recoil_t = 0.0
-            elif not GAME_OVER and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                bx = player_x + dir_x * 0.4
-                by = player_y + dir_y * 0.4
-                speed = 10.0
-                player_bullets.append(Bullet(bx, by, dir_x * speed, dir_y * speed, friendly=True))
-                firing = True
-                recoil_t = 0.0
-
-        handle_input(dt, controls_enabled=not GAME_OVER)
-
-        # Oppdater spiller-kuler + treff på fiender
-        for b in player_bullets:
-            b.update(dt)
-            if not b.alive: continue
-            for e in enemies:
-                if e.remove or e.dying: continue
-                dx = e.x - b.x; dy = e.y - b.y
-                if dx*dx + dy*dy <= (e.radius * e.radius):
-                    e.hit()
-                    b.alive = False
-                    break
-        player_bullets = [b for b in player_bullets if b.alive]
-
-        # Fiende-oppdatering (inkl skudd)
-        for e in enemies:
-            e.update(dt, renderer.enemy_sheets, enemy_bullets)
-        enemies = [e for e in enemies if not e.remove]
-
-        # --------- RANDOM SPAWNING (nå her, hver frame) ----------
-        if not GAME_OVER:
-            spawn_timer -= dt
-            SAFETY_STEP = 0.25
-            max_spawns_this_frame = 4
-            spawns_done = 0
-            while spawn_timer <= 0.0 and spawns_done < max_spawns_this_frame:
-                current_live = live_enemy_count(enemies)
-                if current_live >= MAX_LIVE_ENEMIES:
-                    spawn_timer += SAFETY_STEP
-                    break
-                pos = random_spawn_pos()
-                if pos is not None:
-                    enemies.append(Enemy(pos[0], pos[1]))
-                    spawns_done += 1
-                    spawn_interval = max(SPAWN_INTERVAL_MIN, spawn_interval * SPAWN_INTERVAL_FACTOR)
-                    spawn_timer += spawn_interval
-                    # Debug:
-                    # print(f"[SPAWN] enemy @ ({pos[0]:.1f},{pos[1]:.1f}) | live={current_live+1} | next≈{spawn_interval:.2f}s")
                 else:
-                    spawn_timer += SAFETY_STEP
-        # --------------------------------------------------------
+                    print("[AMMO] empty")
 
-        # Oppdater fiende-kuler + treff på spiller
-        if player_hit_t > 0.0:
-            player_hit_t = max(0.0, player_hit_t - dt)
+        handle_input(dt)
 
-        for b in enemy_bullets:
+        # Timed enemy spawns from random corner
+        enemy_spawn_timer += dt
+        if enemy_spawn_timer >= ENEMY_SPAWN_INTERVAL:
+            enemy_spawn_timer -= ENEMY_SPAWN_INTERVAL
+            if sum(1 for e in enemies if e.alive or e.dying) < ENEMY_MAX:
+                corners = corner_spawn_positions()
+                random.shuffle(corners)
+                for (sx, sy) in corners:
+                    # avoid spawning on top of another enemy (simple radius check)
+                    too_close = any((math.hypot(e.x - sx, e.y - sy) < 1.0) for e in enemies if e.alive or e.dying)
+                    if far_from_player(sx, sy, ENEMY_MIN_PLAYER_DIST) and not too_close:
+                        enemies.append(Enemy(sx, sy))
+                        break  # spawn one this tick
+
+
+        # Spawn timer
+        spawn_timer += dt
+        if spawn_timer >= SPAWN_INTERVAL:
+            spawn_timer -= SPAWN_INTERVAL
+            pos = random_empty_cell(min_dist_from_player=3.0)
+            if pos is not None:
+                px, py = pos
+                pickups.append(Pickup(px, py))
+                # (optional) print where it spawned
+                # print(f"[PICKUP] spawned at {px:.1f}, {py:.1f}")
+
+
+        # Oppdater bullets
+        for b in bullets:
             b.update(dt)
-            if not b.alive: continue
-            dx = player_x - b.x; dy = player_y - b.y
-            if dx*dx + dy*dy <= (PLAYER_RADIUS * PLAYER_RADIUS):
-                b.alive = False
-                if not GAME_OVER:
-                    player_hp = max(0, player_hp - 10)
-                    player_hit_t = 0.25
-                    if player_hp <= 0:
-                        GAME_OVER = True
-        enemy_bullets = [b for b in enemy_bullets if b.alive]
+            if not b.alive:
+                continue
+            for e in enemies:
+                if not e.alive:
+                    continue
+                dx = e.x - b.x
+                dy = e.y - b.y
+                if dx * dx + dy * dy <= (e.radius * e.radius):
+                    if not e.dying:              # only trigger once
+                        e.dying = True
+                        e.happy_timer = 2.0      # show sjefenglad for 2 seconds
+                    b.alive = False              # consume projectile
+                    break
+        bullets = [b for b in bullets if b.alive]
+
+        # Oppdater fiender
+        for e in enemies:
+            e.update(dt)
+
+        # Check if any enemy touches the player
+        for e in enemies:
+            if e.alive and not e.dying:
+                if math.hypot(e.x - player_x, e.y - player_y) <= e.radius + 0.2:
+                    # Trigger kill screen
+                    gl.glClearColor(0,0,0,1)
+                    gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+                    quad = build_fullscreen_quad()
+                    renderer.draw_arrays(quad, renderer.textures[999], use_tex=True)
+                    pygame.display.flip()
+                    pygame.time.wait(20000)   # show for 2 sec (adjust as you like)
+                    running = False
+                    break
+
+
+        # Collect if close
+        for p in pickups:
+            if not p.alive:
+                continue
+            if math.hypot(p.x - player_x, p.y - player_y) <= PICKUP_RADIUS:
+                p.alive = False
+                ammo += 3
+                refresh_ammo_tex()
+                print(f"[AMMO] +3 -> {ammo}")
+        # Compact list
+        pickups = [p for p in pickups if p.alive]
+
 
         # ---------- Render ----------
         gl.glViewport(0, 0, WIDTH, HEIGHT)
         gl.glClearColor(0.05, 0.07, 0.1, 1.0)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
-        # Bakgrunn
+        # Bakgrunn (himmel/gulv)
         bg = build_fullscreen_background()
         renderer.draw_arrays(bg, renderer.white_tex, use_tex=False)
 
-        # Vegger
+        # Vegger (batch pr. tex_id)
         batches_lists = cast_and_build_wall_batches()
         for tid, verts_list in batches_lists.items():
-            if tid not in renderer.textures or not verts_list:
+            if tid not in renderer.textures:
+                continue
+            if not verts_list:
                 continue
             arr = np.asarray(verts_list, dtype=np.float32).reshape((-1, 8))
             renderer.draw_arrays(arr, renderer.textures[tid], use_tex=True)
 
-        # Kuler (kombiner for tegning – teksturen er lik)
-        all_bullets = []
-        all_bullets.extend(player_bullets)
-        all_bullets.extend(enemy_bullets)
-        spr = build_sprites_batch(all_bullets)
+        # Sprites (kuler)
+        spr = build_sprites_batch(bullets)
         if spr.size:
             renderer.draw_arrays(spr, renderer.textures[99], use_tex=True)
 
-        # Fiender
-        enemy_batches = build_enemy_batches(enemies, renderer.enemy_sheets)
-        for tex_id, arr in enemy_batches.items():
-            if arr.size:
-                renderer.draw_arrays(arr, tex_id, use_tex=True)
+        # Enemies (billboards)
+        # Enemies: normal + happy (two batches, two textures)
+        normal_batch = build_enemies_batch_filtered(enemies, use_happy=False)
+        if normal_batch.size:
+            renderer.draw_arrays(normal_batch, renderer.textures[200], use_tex=True)
+
+        happy_batch = build_enemies_batch_filtered(enemies, use_happy=True)
+        if happy_batch.size:
+            renderer.draw_arrays(happy_batch, renderer.textures[201], use_tex=True)
+
+        # Ammo pickups
+        pk = build_pickups_batch(pickups)
+        if pk.size:
+            renderer.draw_arrays(pk, renderer.textures[150], use_tex=True)
+
 
         # Crosshair
         cross = build_crosshair_quads(8, 2)
         renderer.draw_arrays(cross, renderer.white_tex, use_tex=False)
 
         # Weapon overlay
+        # Weapon sprite overlay (hands + CV papers)
         if firing:
             recoil_t += dt
             if recoil_t > 0.15:
                 firing = False
-        overlay = build_weapon_overlay(firing, recoil_t)
-        renderer.draw_arrays(overlay, renderer.white_tex, use_tex=False)
 
-        # Rød hit-flash overlay (subtil)
-        if player_hit_t > 0.0:
-            verts = np.asarray([
-                [-1,  1, 0,0, 1.0,0.0,0.0, 0.0],
-                [-1, -1, 0,1, 1.0,0.0,0.0, 0.0],
-                [ 1,  1, 1,0, 1.0,0.0,0.0, 0.0],
-                [ 1,  1, 1,0, 1.0,0.0,0.0, 0.0],
-                [-1, -1, 0,1, 1.0,0.0,0.0, 0.0],
-                [ 1, -1, 1,1, 1.0,0.0,0.0, 0.0],
-            ], dtype=np.float32)
-            renderer.draw_arrays(verts, renderer.white_tex, use_tex=False)
+        weapon_verts = build_weapon_sprite_overlay(renderer.weapon_w, renderer.weapon_h, firing, recoil_t)
+        if ammo > 0:
+            tex = renderer.weapon_tex
+        else:
+            tex = renderer.weapon_empty_tex
+        renderer.draw_arrays(weapon_verts, tex, use_tex=True)
 
-        # Minimap (med fiender)
-        mm = build_minimap_quads(enemies)
+        # --- HUD: draw ammo text top-left (padding 10 px) ---
+        if ammo_tex:
+            gl.glDepthMask(gl.GL_FALSE)        # don't write depth for UI
+            hud = build_hud_quad_px(10, 10, ammo_w, ammo_h)
+            renderer.draw_arrays(hud, ammo_tex, use_tex=True)
+            gl.glDepthMask(gl.GL_TRUE)
+
+        # Minimap
+        mm = build_minimap_quads()
         renderer.draw_arrays(mm, renderer.white_tex, use_tex=False)
-
-        # Game over-overlay
-        if GAME_OVER:
-            verts = np.asarray([
-                [-1,  1, 0,0, 0.0,0.0,0.0, 0.0],
-                [-1, -1, 0,1, 0.0,0.0,0.0, 0.0],
-                [ 1,  1, 1,0, 0.0,0.0,0.0, 0.0],
-                [ 1,  1, 1,0, 0.0,0.0,0.0, 0.0],
-                [-1, -1, 0,1, 0.0,0.0,0.0, 0.0],
-                [ 1, -1, 1,1, 0.0,0.0,0.0, 0.0],
-            ], dtype=np.float32)
-            renderer.draw_arrays(verts, renderer.white_tex, use_tex=False)
 
         pygame.display.flip()
 
