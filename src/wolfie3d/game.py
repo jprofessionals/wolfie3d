@@ -118,6 +118,38 @@ def clamp01(x: float) -> float:
     if x > 1.0: return 1.0
     return x
 
+# Sett over synlige/utforskede fliser for minimap
+seen_tiles: set[tuple[int, int]] = set()
+
+def compute_reachable() -> set[tuple[int, int]]:
+    """Flood fill fra spillerposisjon gjennom åpne celler (0) og HELT åpne dører.
+    Returnerer sett av passérbare fliser (ikke vegger)."""
+    sx, sy = int(player_x), int(player_y)
+    if not in_map(sx, sy):
+        return set()
+    q: list[tuple[int, int]] = [(sx, sy)]
+    visited: set[tuple[int, int]] = {(sx, sy)}
+    def passable(ix: int, iy: int) -> bool:
+        if not in_map(ix, iy):
+            return False
+        cell = MAP[iy][ix]
+        if cell == 0:
+            return True
+        if cell == DOOR_TILE_ID:
+            d = doors.get((ix, iy))
+            return bool(d and d.anim >= 0.999)
+        return False
+    while q:
+        x, y = q.pop(0)
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            nx, ny = x+dx, y+dy
+            if (nx, ny) in visited:
+                continue
+            if passable(nx, ny):
+                visited.add((nx, ny))
+                q.append((nx, ny))
+    return visited
+
 # ---------- Prosjektil ----------
 class Bullet:
     def __init__(self, x: float, y: float, vx: float, vy: float) -> None:
@@ -1226,7 +1258,13 @@ def build_weapon_overlay(firing: bool, recoil_t: float) -> np.ndarray:
     return np.asarray(verts, dtype=np.float32).reshape((-1, 8))
 
 def build_minimap_quads() -> np.ndarray:
-    """Liten GL-basert minimap øverst til venstre."""
+    """Liten GL-basert minimap øverst til venstre.
+    - Dører: blå
+    - Tilgjengelige vegger: hvit/grå
+    - Sett men utilgjengelig: lysegrå prikker
+    - Usett utilgjengelig: ikke rendres
+    """
+    global seen_tiles
     scale = 6
     mm_w = MAP_W * scale
     mm_h = MAP_H * scale
@@ -1248,21 +1286,49 @@ def build_minimap_quads() -> np.ndarray:
             x1, y1, 1.0, 1.0, r, g, b, depth,
         ])
 
+    def add_dot_px(cx_px, cy_px, col, depth):
+        # liten prikk 2x2 px sentrert i cellen
+        r, g, b = col
+        x_px = cx_px - 1
+        y_px = cy_px - 1
+        add_quad_px(x_px, y_px, 2, 2, col, depth)
+
     # Bakgrunn
     add_quad_px(pad-2, pad-2, mm_w+4, mm_h+4, (0.1, 0.1, 0.1), 0.0)
 
-    # Celler
+    # Finn tilgjengelige fliser nå og oppdater 'seen'
+    reachable = compute_reachable()
+    seen_tiles |= reachable
+
+    def any_neighbor_in(s: set[tuple[int,int]], x: int, y: int) -> bool:
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            if (x+dx, y+dy) in s:
+                return True
+        return False
+
+    door_blue = (0.2, 0.6, 1.0)
+    wall_white = (0.86, 0.86, 0.86)
+    seen_dot = (0.7, 0.7, 0.7)
+
     for y in range(MAP_H):
         for x in range(MAP_W):
             cell = MAP[y][x]
-            if cell > 0:
-                # Dør tegnes kun hvis ikke helt åpen
-                if cell == DOOR_TILE_ID:
-                    d = doors.get((x, y))
-                    if d and d.anim >= 0.999:
-                        continue
-                col = (0.86, 0.86, 0.86)
-                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, col, 0.0)
+            if cell <= 0:
+                continue
+            # Skjul vegger i utilgjengelige/uset områder
+            accessible = any_neighbor_in(reachable, x, y)
+            if not accessible:
+                # men om området er sett tidligere (nabo er i seen), tegn prikk
+                if any_neighbor_in(seen_tiles, x, y):
+                    cx = pad + x*scale + (scale//2)
+                    cy = pad + y*scale + (scale//2)
+                    add_dot_px(cx, cy, seen_dot, 0.0)
+                continue
+            # Dører i blått, ellers hvit
+            if cell == DOOR_TILE_ID:
+                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, door_blue, 0.0)
+            else:
+                add_quad_px(pad + x*scale, pad + y*scale, scale-1, scale-1, wall_white, 0.0)
 
     # Spiller
     px = int(player_x * scale)
@@ -1405,6 +1471,9 @@ def main() -> None:
     # Init dører i kartet: merk MAP-cellen som dør
     MAP[DOOR_Y][DOOR_X] = DOOR_TILE_ID
     doors[(DOOR_X, DOOR_Y)] = Door(DOOR_X, DOOR_Y)
+    # Init minimap 'seen' som nåværende tilgjengelig område
+    global seen_tiles
+    seen_tiles |= compute_reachable()
 
     # Mus-capture (synlig cursor + crosshair)
     pygame.event.set_grab(True)
