@@ -59,8 +59,7 @@ FAR_PLANE = 100.0
 # Dør-konstanter
 DOOR_TILE_ID = 9        # spesialverdi i MAP for dør-celle
 DOOR_TEX_ID = 3         # bruker treteksturen visuelt
-# Midlertidig: sett høy animasjonstid for testing
-DOOR_ANIM_TIME = 4.0    # sekunder opp/ned (test)
+DOOR_ANIM_TIME = 0.2    # sekunder opp/ned
 DOOR_AUTO_CLOSE = 2.0   # sekunder etter åpning
 
 # Kart (0=tomt, >0=veggtype/tekstur-id)
@@ -681,7 +680,13 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
                 if p >= 0.999:
                     continue
                 if door_hit is None or dist < door_hit['dist']:
-                    door_hit = {'dist': dist, 'side': side, 'u': u, 'anim': max(0.0, min(1.0, p))}
+                    door_hit = {
+                        'dist': dist,
+                        'side': side,
+                        'u': u,
+                        'anim': max(0.0, min(1.0, p)),
+                        'state': (d.state if d else 'opening'),
+                    }
                 continue
             else:
                 wall_hit = {'dist': dist, 'side': side, 'u': u, 'tex': cell}
@@ -724,20 +729,28 @@ def cast_and_build_wall_batches() -> dict[int, list[float]]:
             sided = door_hit['side']
             ud = door_hit['u']
             p = door_hit['anim']
+            st = door_hit.get('state', 'opening')
             lh = int(HEIGHT / (dist + 1e-6))
             rs0 = -lh / 2.0 + HALF_H
             re0 = rs0 + lh
-            rs = min(re0, rs0 + p * lh)
-            re = re0
+            if st == 'closing':
+                # Slide up: keep bottom fixed, erase from top as p decreases
+                rs = max(rs0, re0 - (1.0 - p) * lh)
+                re = re0
+            else:
+                # Opening: slide down, top moves down, bottom fixed
+                rs = min(re0, rs0 + p * lh)
+                re = re0
             ds = max(0, int(rs))
             de = min(HEIGHT - 1, int(re))
             if ds < de:
                 top = y_ndc(ds)
                 bot = y_ndc(de)
-                v0 = (ds - rs0) / max(1.0, float(lh))
-                v1 = (de - rs0) / max(1.0, float(lh))
-                v0 = min(1.0 - TEX_EPS, max(TEX_EPS, v0))
-                v1 = min(1.0 - TEX_EPS, max(TEX_EPS, v1))
+                # Texture slides with the panel: use a global offset of -p and allow wrapping.
+                # This makes the content translate downward during opening and upward during closing.
+                tex_off = -p
+                v0 = ((ds - rs0) / max(1.0, float(lh))) + tex_off
+                v1 = ((de - rs0) / max(1.0, float(lh))) + tex_off
                 c = dim_for_side(sided)
                 r = g = b = c
                 depth = clamp01(dist / FAR_PLANE)
